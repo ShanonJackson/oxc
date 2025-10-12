@@ -1,6 +1,6 @@
-use std::{borrow::Cow, iter::FusedIterator};
+use std::{borrow::Cow, cell::Cell, iter::FusedIterator};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use oxc_ast::{Comment, CommentKind, ast::Program};
 use oxc_syntax::identifier::is_line_terminator;
@@ -11,7 +11,263 @@ use crate::{
     str::{LS_LAST_2_BYTES, LS_OR_PS_FIRST_BYTE, PS_LAST_2_BYTES},
 };
 
-pub type CommentsMap = FxHashMap</* attached_to */ u32, Vec<Comment>>;
+pub struct CommentsMap {
+    buckets: Vec<CommentBucket>,
+    storage: Vec<Comment>,
+    active: usize,
+    cursor: Cell<usize>,
+}
+
+impl Default for CommentsMap {
+    fn default() -> Self {
+        Self { buckets: Vec::new(), storage: Vec::new(), active: 0, cursor: Cell::new(0) }
+    }
+}
+
+struct CommentBucket {
+    key: u32,
+    start: usize,
+    len: usize,
+    consumed: bool,
+}
+
+impl CommentBucket {
+    #[inline]
+    fn new(key: u32, start: usize) -> Self {
+        Self { key, start, len: 1, consumed: false }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CommentBlock {
+    ptr: *const Comment,
+    len: usize,
+}
+
+impl CommentBlock {
+    #[inline]
+    fn new(ptr: *const Comment, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    #[inline]
+    pub fn len(self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn iter(self) -> CommentBlockIter {
+        CommentBlockIter { ptr: self.ptr, end: unsafe { self.ptr.add(self.len) } }
+    }
+}
+
+pub(crate) struct CommentBlockIter {
+    ptr: *const Comment,
+    end: *const Comment,
+}
+
+impl Iterator for CommentBlockIter {
+    type Item = Comment;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ptr == self.end {
+            None
+        } else {
+            // SAFETY: `ptr` always advances towards `end`, and both originate from the same slice.
+            let comment = unsafe { *self.ptr };
+            // SAFETY: `ptr < end`, so incrementing by 1 stays within the original slice bounds.
+            self.ptr = unsafe { self.ptr.add(1) };
+            Some(comment)
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = unsafe { self.end.offset_from(self.ptr) as usize };
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for CommentBlockIter {}
+
+impl FusedIterator for CommentBlockIter {}
+
+impl CommentsMap {
+    #[inline]
+    pub fn clear(&mut self) {
+        self.buckets.clear();
+        self.storage.clear();
+        self.active = 0;
+        self.cursor.set(0);
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.active == 0
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &u32) -> bool {
+        self.find_index(*key)
+            .map(|idx| {
+                let bucket = &self.buckets[idx];
+                !bucket.consumed && bucket.len > 0
+            })
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.storage.reserve(additional);
+        self.buckets.reserve(additional);
+    }
+
+    #[inline]
+    pub fn insert_comment(&mut self, key: u32, comment: Comment) {
+        if let Some(bucket) = self.buckets.last_mut() {
+            if bucket.key == key {
+                debug_assert_eq!(bucket.start + bucket.len, self.storage.len());
+                self.storage.push(comment);
+                bucket.len += 1;
+                return;
+            }
+            if key > bucket.key {
+                let start = self.storage.len();
+                self.storage.push(comment);
+                self.buckets.push(CommentBucket::new(key, start));
+                self.active += 1;
+                return;
+            }
+        } else {
+            let start = self.storage.len();
+            self.storage.push(comment);
+            self.buckets.push(CommentBucket::new(key, start));
+            self.active = 1;
+            return;
+        }
+
+        self.insert_comment_slow_path(key, comment);
+    }
+
+    #[inline]
+    pub fn remove(&mut self, key: &u32) -> Option<CommentBlock> {
+        let idx = self.locate_bucket(*key)?;
+        let (start, len) = {
+            let bucket = &mut self.buckets[idx];
+            if bucket.consumed || bucket.len == 0 {
+                return None;
+            }
+            bucket.consumed = true;
+            self.active = self.active.saturating_sub(1);
+            (bucket.start, bucket.len)
+        };
+        self.cursor.set(idx.saturating_add(1));
+        Some(self.block_from_parts(start, len))
+    }
+
+    #[inline]
+    pub fn peek(&self, key: u32) -> Option<CommentBlock> {
+        let idx = self.locate_bucket(key)?;
+        Some(self.block_from_parts(self.buckets[idx].start, self.buckets[idx].len))
+    }
+
+    #[inline]
+    fn find_index(&self, key: u32) -> Result<usize, usize> {
+        self.buckets.binary_search_by_key(&key, |bucket| bucket.key)
+    }
+
+    #[inline(always)]
+    fn locate_bucket(&self, key: u32) -> Option<usize> {
+        if self.buckets.is_empty() {
+            return None;
+        }
+        let len = self.buckets.len();
+        let mut cursor = self.cursor.get().min(len.saturating_sub(1));
+        let mut bucket = &self.buckets[cursor];
+        if bucket.key == key && !bucket.consumed && bucket.len > 0 {
+            return Some(cursor);
+        }
+
+        if bucket.key < key {
+            while cursor + 1 < len {
+                cursor += 1;
+                bucket = &self.buckets[cursor];
+                if bucket.key > key {
+                    break;
+                }
+                if bucket.key == key && !bucket.consumed && bucket.len > 0 {
+                    self.cursor.set(cursor);
+                    return Some(cursor);
+                }
+            }
+        } else {
+            while cursor > 0 {
+                cursor -= 1;
+                bucket = &self.buckets[cursor];
+                if bucket.key < key {
+                    break;
+                }
+                if bucket.key == key && !bucket.consumed && bucket.len > 0 {
+                    self.cursor.set(cursor);
+                    return Some(cursor);
+                }
+            }
+        }
+
+        let idx = self.find_index(key).ok()?;
+        let bucket = &self.buckets[idx];
+        if bucket.consumed || bucket.len == 0 {
+            None
+        } else {
+            self.cursor.set(idx);
+            Some(idx)
+        }
+    }
+
+    #[cold]
+    fn insert_comment_slow_path(&mut self, key: u32, comment: Comment) {
+        match self.find_index(key) {
+            Ok(idx) => {
+                debug_assert!(!self.buckets[idx].consumed);
+                let bucket = &mut self.buckets[idx];
+                let insert_at = bucket.start + bucket.len;
+                self.storage.insert(insert_at, comment);
+                bucket.len += 1;
+                for later in &mut self.buckets[idx + 1..] {
+                    later.start += 1;
+                }
+            }
+            Err(idx) => {
+                let insert_at = if idx == self.buckets.len() {
+                    self.storage.len()
+                } else {
+                    self.buckets[idx].start
+                };
+                self.storage.insert(insert_at, comment);
+                if idx < self.buckets.len() {
+                    for later in &mut self.buckets[idx..] {
+                        later.start += 1;
+                    }
+                }
+                self.buckets.insert(idx, CommentBucket::new(key, insert_at));
+                self.active += 1;
+                self.cursor.set(idx);
+            }
+        }
+    }
+
+    #[inline]
+    fn block_from_parts(&self, start: usize, len: usize) -> CommentBlock {
+        let ptr = unsafe { self.storage.as_ptr().add(start) };
+        CommentBlock::new(ptr, len)
+    }
+}
 
 /// Custom iterator that splits text on line terminators while handling CRLF as a single unit.
 /// This avoids creating empty strings between CR and LF characters.
@@ -100,6 +356,7 @@ impl Codegen<'_> {
         if self.options.comments == CommentOptions::disabled() {
             return;
         }
+        self.comments.reserve(comments.len());
         for comment in comments {
             // Omit pure comments because they are handled separately.
             if comment.is_pure() || comment.is_no_side_effects() {
@@ -121,7 +378,7 @@ impl Codegen<'_> {
                 }
             }
             if add {
-                self.comments.entry(comment.attached_to).or_default().push(*comment);
+                self.comments.insert_comment(comment.attached_to, *comment);
             }
         }
     }
@@ -132,11 +389,11 @@ impl Codegen<'_> {
 
     pub(crate) fn print_leading_comments(&mut self, start: u32) {
         if let Some(comments) = self.comments.remove(&start) {
-            self.print_comments(&comments);
+            self.print_comments(comments);
         }
     }
 
-    pub(crate) fn get_comments(&mut self, start: u32) -> Option<Vec<Comment>> {
+    pub(crate) fn take_comments(&mut self, start: u32) -> Option<CommentBlock> {
         if self.comments.is_empty() {
             return None;
         }
@@ -144,9 +401,17 @@ impl Codegen<'_> {
     }
 
     #[inline]
+    pub(crate) fn peek_comments(&self, start: u32) -> Option<CommentBlock> {
+        if self.comments.is_empty() {
+            return None;
+        }
+        self.comments.peek(start)
+    }
+
+    #[inline]
     pub(crate) fn print_comments_at(&mut self, start: u32) {
-        if let Some(comments) = self.get_comments(start) {
-            self.print_comments(&comments);
+        if let Some(comments) = self.take_comments(start) {
+            self.print_comments(comments);
         }
     }
 
@@ -155,22 +420,25 @@ impl Codegen<'_> {
             return false;
         }
         let Some(comments) = self.comments.remove(&start) else { return false };
+        if comments.is_empty() {
+            return false;
+        }
 
-        for comment in &comments {
+        for comment in comments.iter() {
             self.print_hard_newline();
             self.print_indent();
-            self.print_comment(comment);
+            self.print_comment(&comment);
         }
 
-        if comments.is_empty() {
-            false
-        } else {
-            self.print_hard_newline();
-            true
-        }
+        self.print_hard_newline();
+        true
     }
 
-    pub(crate) fn print_comments(&mut self, comments: &[Comment]) {
+    pub(crate) fn print_comments(&mut self, comments: CommentBlock) {
+        let total = comments.len();
+        if total == 0 {
+            return;
+        }
         for (i, comment) in comments.iter().enumerate() {
             if i == 0 {
                 if comment.preceded_by_newline() {
@@ -197,8 +465,8 @@ impl Codegen<'_> {
                     self.print_hard_newline();
                 }
             }
-            self.print_comment(comment);
-            if i == comments.len() - 1 {
+            self.print_comment(&comment);
+            if i == total - 1 {
                 if comment.is_line() || comment.followed_by_newline() {
                     self.print_hard_newline();
                 } else {
