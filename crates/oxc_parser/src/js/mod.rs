@@ -36,3 +36,4 @@ pub enum VariableDeclarationParent {
     For,
     Statement,
 }
+
