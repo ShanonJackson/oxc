@@ -123,12 +123,12 @@ impl FastBuffer {
     #[inline(always)]
     pub fn print_ascii_byte(&mut self, byte: u8) {
         assert!(byte.is_ascii(), "byte {byte} is not ASCII");
-        unsafe { self.print_byte_unchecked(byte) };
+        self.write_single_byte(byte);
     }
 
     #[inline(always)]
     pub unsafe fn print_byte_unchecked(&mut self, byte: u8) {
-        self.write_bytes(slice::from_ref(&byte));
+        self.write_single_byte(byte);
     }
 
     #[inline]
@@ -199,12 +199,15 @@ impl FastBuffer {
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
+        match bytes.len() {
+            0 => return,
+            1 => {
+                self.write_single_byte(bytes[0]);
+                return;
+            }
+            _ => {}
         }
-        unsafe {
-            self.buf.set_len(self.len);
-        }
+        debug_assert_eq!(self.buf.len(), self.len);
         self.update_tail(bytes);
         let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
@@ -226,6 +229,36 @@ impl FastBuffer {
         self.len = new_len;
         unsafe {
             self.buf.set_len(new_len);
+        }
+    }
+
+    #[inline(always)]
+    fn write_single_byte(&mut self, byte: u8) {
+        debug_assert_eq!(self.buf.len(), self.len);
+        self.push_tail_byte(byte);
+        let new_len =
+            self.len.checked_add(1).expect("fast buffer length overflow while writing byte");
+        if new_len > self.buf.capacity() {
+            let target = new_len.next_power_of_two().max(64);
+            let additional = target - self.buf.len();
+            self.buf.reserve_exact(additional);
+        }
+        unsafe {
+            let dst = self.buf.as_mut_ptr().add(self.len);
+            ptr::write(dst, byte);
+            self.len = new_len;
+            self.buf.set_len(new_len);
+        }
+    }
+
+    #[inline(always)]
+    fn push_tail_byte(&mut self, byte: u8) {
+        if self.tail_len < TAIL_CAPACITY {
+            self.tail[self.tail_len] = byte;
+            self.tail_len += 1;
+        } else {
+            self.tail.copy_within(1..TAIL_CAPACITY, 0);
+            self.tail[TAIL_CAPACITY - 1] = byte;
         }
     }
 
