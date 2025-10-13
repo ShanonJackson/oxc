@@ -1,6 +1,6 @@
 #![expect(clippy::redundant_pub_crate)]
 
-use std::{ptr, slice, str};
+use std::{char, ptr, slice};
 
 use oxc_data_structures::code_buffer::{DEFAULT_INDENT_WIDTH, IndentChar};
 
@@ -9,6 +9,61 @@ pub(crate) struct FastBuffer {
     len: usize,
     indent_char: IndentChar,
     indent_width: usize,
+}
+
+#[inline(always)]
+const fn utf8_lead_byte_width(byte: u8) -> usize {
+    if byte & 0x80 == 0 {
+        1
+    } else if byte & 0xE0 == 0xC0 {
+        2
+    } else if byte & 0xF0 == 0xE0 {
+        3
+    } else {
+        4
+    }
+}
+
+#[inline(always)]
+unsafe fn decode_two(lead: u8, cont: *const u8) -> char {
+    let b2 = unsafe { *cont };
+    debug_assert_eq!(lead & 0xE0, 0xC0);
+    debug_assert_eq!(b2 & 0xC0, 0x80);
+    let code = ((lead & 0x1F) as u32) << 6 | (b2 & 0x3F) as u32;
+    debug_assert!(char::from_u32(code).is_some());
+    unsafe { char::from_u32_unchecked(code) }
+}
+
+#[inline(always)]
+unsafe fn decode_three(lead: u8, cont: *const u8) -> char {
+    let b2 = unsafe { *cont };
+    let cont1 = unsafe { cont.add(1) };
+    let b3 = unsafe { *cont1 };
+    debug_assert_eq!(lead & 0xF0, 0xE0);
+    debug_assert_eq!(b2 & 0xC0, 0x80);
+    debug_assert_eq!(b3 & 0xC0, 0x80);
+    let code = ((lead & 0x0F) as u32) << 12 | ((b2 & 0x3F) as u32) << 6 | (b3 & 0x3F) as u32;
+    debug_assert!(char::from_u32(code).is_some());
+    unsafe { char::from_u32_unchecked(code) }
+}
+
+#[inline(always)]
+unsafe fn decode_four(lead: u8, cont: *const u8) -> char {
+    let b2 = unsafe { *cont };
+    let cont1 = unsafe { cont.add(1) };
+    let b3 = unsafe { *cont1 };
+    let cont2 = unsafe { cont.add(2) };
+    let b4 = unsafe { *cont2 };
+    debug_assert_eq!(lead & 0xF8, 0xF0);
+    debug_assert_eq!(b2 & 0xC0, 0x80);
+    debug_assert_eq!(b3 & 0xC0, 0x80);
+    debug_assert_eq!(b4 & 0xC0, 0x80);
+    let code = ((lead & 0x07) as u32) << 18
+        | ((b2 & 0x3F) as u32) << 12
+        | ((b3 & 0x3F) as u32) << 6
+        | (b4 & 0x3F) as u32;
+    debug_assert!(char::from_u32(code).is_some());
+    unsafe { char::from_u32_unchecked(code) }
 }
 
 impl Default for FastBuffer {
@@ -82,28 +137,48 @@ impl FastBuffer {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn last_char(&self) -> Option<char> {
-        let mut buf = [0u8; 4];
-        let mut filled = 0;
-        let mut offset = 0usize;
-
-        while offset < self.len && filled < 4 {
-            let idx = self.len - 1 - offset;
-            let byte = unsafe { *self.buf.as_ptr().add(idx) };
-            buf[3 - filled] = byte;
-            filled += 1;
-            if byte & 0b1000_0000 == 0 {
-                return Some(byte as char);
-            }
-            if byte & 0b1100_0000 != 0b1000_0000 {
-                let start = 4 - filled;
-                return str::from_utf8(&buf[start..]).ok().and_then(|s| s.chars().next());
-            }
-            offset += 1;
+        if self.len == 0 {
+            return None;
         }
 
-        None
+        unsafe {
+            let ptr = self.buf.as_ptr();
+            let mut index = self.len - 1;
+            let mut byte = *ptr.add(index);
+
+            if byte & 0x80 == 0 {
+                return Some(byte as char);
+            }
+
+            let mut continuation_bytes = 0usize;
+            while byte & 0xC0 == 0x80 {
+                continuation_bytes += 1;
+                if index == 0 {
+                    return None;
+                }
+                index -= 1;
+                byte = *ptr.add(index);
+            }
+
+            let width = utf8_lead_byte_width(byte);
+            debug_assert!(
+                width > continuation_bytes,
+                "utf-8 width {width} shorter than continuation count {continuation_bytes}",
+            );
+            if width - 1 != continuation_bytes {
+                return None;
+            }
+            let slice_ptr = ptr.add(index);
+
+            Some(match width {
+                2 => decode_two(byte, slice_ptr.add(1)),
+                3 => decode_three(byte, slice_ptr.add(1)),
+                4 => decode_four(byte, slice_ptr.add(1)),
+                _ => unreachable!("ASCII handled earlier"),
+            })
+        }
     }
 
     #[inline]
