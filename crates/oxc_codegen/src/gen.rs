@@ -192,7 +192,7 @@ impl Gen for Statement<'_> {
 impl Gen for ExpressionStatement<'_> {
     fn r#gen(&self, p: &mut Codegen, _ctx: Context) {
         p.print_comments_at(self.span.start);
-        if !p.options.minify && (p.indent > 0 || p.print_next_indent_as_space) {
+        if !p.minify && (p.indent > 0 || p.print_next_indent_as_space) {
             p.add_source_mapping(self.span);
             p.print_indent();
         }
@@ -555,7 +555,7 @@ impl Gen for ReturnStatement<'_> {
 impl Gen for LabeledStatement<'_> {
     fn r#gen(&self, p: &mut Codegen, ctx: Context) {
         p.print_comments_at(self.span.start);
-        if !p.options.minify && (p.indent > 0 || p.print_next_indent_as_space) {
+        if !p.minify && (p.indent > 0 || p.print_next_indent_as_space) {
             p.add_source_mapping(self.span);
             p.print_indent();
         }
@@ -1276,7 +1276,7 @@ impl GenExpr for NumericLiteral<'_> {
             p.print_space_before_identifier();
             p.print_str("NaN");
         } else if value.is_infinite() {
-            let wrap = (p.options.minify && precedence >= Precedence::Multiply)
+            let wrap = (p.minify && precedence >= Precedence::Multiply)
                 || (value.is_sign_negative() && precedence >= Precedence::Prefix);
             p.wrap(wrap, |p| {
                 if value.is_sign_negative() {
@@ -1285,7 +1285,7 @@ impl GenExpr for NumericLiteral<'_> {
                 } else {
                     p.print_space_before_identifier();
                 }
-                if p.options.minify {
+                if p.minify {
                     p.print_str("1/0");
                 } else {
                     p.print_str("Infinity");
@@ -1669,7 +1669,7 @@ impl GenExpr for ArrowFunctionExpression<'_> {
             if let Some(type_parameters) = &self.type_parameters {
                 type_parameters.print(p, ctx);
             }
-            let remove_params_wrap = p.options.minify
+            let remove_params_wrap = p.minify
                 && self.params.items.len() == 1
                 && self.params.rest.is_none()
                 && self.type_parameters.is_none()
@@ -1763,7 +1763,7 @@ impl GenExpr for UnaryExpression<'_> {
             }
             // Forbid `delete Infinity`, which is syntax error in strict mode.
             let is_delete_infinity = self.operator == UnaryOperator::Delete
-                && !p.options.minify
+                && !p.minify
                 && matches!(&self.argument, Expression::NumericLiteral(lit) if lit.value.is_sign_positive() && lit.value.is_infinite());
             if is_delete_infinity {
                 p.print_str("(0,");
@@ -1998,7 +1998,7 @@ impl Gen for AssignmentTargetPropertyIdentifier<'_> {
 
 impl Gen for AssignmentTargetPropertyProperty<'_> {
     fn r#gen(&self, p: &mut Codegen, ctx: Context) {
-        let omit_key = if p.options.minify {
+        let omit_key = if p.minify {
             let key_name = match &self.name {
                 PropertyKey::StaticIdentifier(ident) => Some(&ident.name),
                 _ => None,
@@ -2196,8 +2196,7 @@ impl GenExpr for NewExpression<'_> {
             self.callee.print_expr(p, Precedence::New, Context::FORBID_CALL);
 
             // Omit the "()" when minifying, but only when safe to do so
-            if !p.options.minify || !self.arguments.is_empty() || precedence >= Precedence::Postfix
-            {
+            if !p.minify || !self.arguments.is_empty() || precedence >= Precedence::Postfix {
                 p.print_arguments(self.span, &self.arguments, ctx);
             }
         });
@@ -2241,7 +2240,7 @@ impl GenExpr for TSNonNullExpression<'_> {
             self.expression.print_expr(p, precedence, ctx);
         });
         p.print_ascii_byte(b'!');
-        if p.options.minify {
+        if p.minify {
             p.print_hard_space();
         }
     }
@@ -2251,7 +2250,7 @@ impl GenExpr for TSInstantiationExpression<'_> {
     fn gen_expr(&self, p: &mut Codegen, precedence: Precedence, ctx: Context) {
         self.expression.print_expr(p, precedence, ctx);
         self.type_arguments.print(p, ctx);
-        if p.options.minify {
+        if p.minify {
             p.print_hard_space();
         }
     }
