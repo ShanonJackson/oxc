@@ -226,12 +226,18 @@ impl FastBuffer {
         let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
             let target = Self::align_capacity(new_len);
-            self.buf.reserve(target - self.buf.capacity());
+            self.buf.reserve(target);
             #[cfg(debug_assertions)]
             {
                 self.metrics.reallocations += 1;
             }
         }
+        debug_assert!(
+            self.buf.capacity() >= new_len,
+            "fast buffer capacity {} smaller than requested length {}",
+            self.buf.capacity(),
+            new_len
+        );
         unsafe {
             let dst = self.buf.as_mut_ptr().add(self.len);
             ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
