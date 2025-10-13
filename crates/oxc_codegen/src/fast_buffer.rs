@@ -52,7 +52,9 @@ impl FastBuffer {
     ) {
         let aligned_capacity =
             if capacity == 0 { 64 } else { capacity.next_power_of_two().max(64) };
-        self.buf = Vec::with_capacity(aligned_capacity);
+        if self.buf.capacity() < aligned_capacity {
+            self.buf = Vec::with_capacity(aligned_capacity);
+        }
         self.len = 0;
         self.indent_char = indent_char;
         self.indent_width = indent_width;
@@ -198,7 +200,8 @@ impl FastBuffer {
         let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
             let target = new_len.next_power_of_two().max(64);
-            self.buf.reserve(target);
+            let additional = target - self.buf.len();
+            self.buf.reserve(additional);
         }
         unsafe {
             let dst = self.buf.as_mut_ptr().add(self.len);
