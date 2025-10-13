@@ -94,13 +94,11 @@ impl FastBuffer {
     ) {
         let aligned_capacity =
             if capacity == 0 { 64 } else { capacity.next_power_of_two().max(64) };
-        if self.buf.capacity() < aligned_capacity {
-            let additional = aligned_capacity.saturating_sub(self.buf.len());
-            self.buf.reserve(additional);
+        let current_capacity = self.buf.capacity();
+        if current_capacity < aligned_capacity {
+            self.buf.reserve(aligned_capacity);
         }
-        unsafe {
-            self.buf.set_len(0);
-        }
+        self.buf.clear();
         self.len = 0;
         self.indent_char = indent_char;
         self.indent_width = indent_width;
@@ -271,12 +269,10 @@ impl FastBuffer {
             }
             _ => {}
         }
-        debug_assert_eq!(self.buf.len(), self.len);
         let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
             let target = new_len.next_power_of_two().max(64);
-            let additional = target - self.buf.len();
-            self.buf.reserve_exact(additional);
+            self.buf.reserve(target);
         }
         debug_assert!(
             self.buf.capacity() >= new_len,
@@ -290,46 +286,37 @@ impl FastBuffer {
             ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
         self.len = new_len;
-        unsafe {
-            self.buf.set_len(new_len);
-        }
     }
 
     #[inline(always)]
     fn write_single_byte(&mut self, byte: u8) {
-        debug_assert_eq!(self.buf.len(), self.len);
         let new_len =
             self.len.checked_add(1).expect("fast buffer length overflow while writing byte");
         if new_len > self.buf.capacity() {
             let target = new_len.next_power_of_two().max(64);
-            let additional = target - self.buf.len();
-            self.buf.reserve_exact(additional);
+            self.buf.reserve(target);
         }
         unsafe {
             let dst = self.buf.as_mut_ptr().add(self.len);
             ptr::write(dst, byte);
-            self.len = new_len;
-            self.buf.set_len(new_len);
         }
+        self.len = new_len;
     }
 
     #[inline(always)]
     fn write_repeat_byte(&mut self, byte: u8, count: usize) {
         debug_assert_ne!(count, 0);
-        debug_assert_eq!(self.buf.len(), self.len);
 
         let new_len = self.len.checked_add(count).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
             let target = new_len.next_power_of_two().max(64);
-            let additional = target - self.buf.len();
-            self.buf.reserve_exact(additional);
+            self.buf.reserve(target);
         }
 
         unsafe {
             let dst = self.buf.as_mut_ptr().add(self.len);
             ptr::write_bytes(dst, byte, count);
-            self.len = new_len;
-            self.buf.set_len(new_len);
         }
+        self.len = new_len;
     }
 }
