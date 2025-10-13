@@ -4,8 +4,6 @@ use oxc_index::{IndexVec, define_nonmax_u32_index_type};
 use oxc_span::Span;
 use oxc_syntax::identifier::{LS, PS};
 
-use crate::str::{LS_LAST_2_BYTES, LS_OR_PS_FIRST_BYTE, PS_LAST_2_BYTES};
-
 /// Number of lines to check with linear search when translating byte position to line index
 const LINE_SEARCH_LINEAR_ITERATIONS: usize = 16;
 
@@ -51,12 +49,9 @@ pub struct ColumnOffsets {
 pub struct SourcemapBuilder<'a> {
     source_id: u32,
     original_source: &'a str,
-    last_generated_update: usize,
     last_position: Option<u32>,
     line_offset_tables: LineOffsetTables,
     sourcemap_builder: oxc_sourcemap::SourceMapBuilder,
-    generated_line: u32,
-    generated_column: u32,
     /// Tracks the last accessed line index to optimize sequential lookups in `search_original_line_and_column`.
     /// Most calls to this method access positions in increasing order (e.g., when mapping source tokens linearly),
     /// so we can avoid unnecessary binary searches by advancing linearly from this cached index.
@@ -72,12 +67,9 @@ impl<'a> SourcemapBuilder<'a> {
         Self {
             source_id,
             original_source: source_text,
-            last_generated_update: 0,
             last_position: None,
             line_offset_tables,
             sourcemap_builder,
-            generated_line: 0,
-            generated_column: 0,
             last_line_lookup: 0,
         }
     }
@@ -86,7 +78,13 @@ impl<'a> SourcemapBuilder<'a> {
         self.sourcemap_builder.into_sourcemap()
     }
 
-    pub fn add_source_mapping_for_name(&mut self, output: &[u8], span: Span, name: &str) {
+    pub fn add_source_mapping_for_name(
+        &mut self,
+        generated_line: u32,
+        generated_column: u32,
+        span: Span,
+        name: &str,
+    ) {
         debug_assert!(
             (span.end as usize) <= self.original_source.len(),
             "violated {}:{} <= {} for {name}",
@@ -98,19 +96,24 @@ impl<'a> SourcemapBuilder<'a> {
         // The token name should be original name.
         // If it hasn't change, name should be `None` to reduce `SourceMap` size.
         let token_name = if original_name == Some(name) { None } else { original_name };
-        self.add_source_mapping(output, span.start, token_name);
+        self.add_source_mapping(generated_line, generated_column, span.start, token_name);
     }
 
-    pub fn add_source_mapping(&mut self, output: &[u8], position: u32, name: Option<&str>) {
+    pub fn add_source_mapping(
+        &mut self,
+        generated_line: u32,
+        generated_column: u32,
+        position: u32,
+        name: Option<&str>,
+    ) {
         if self.last_position == Some(position) {
             return;
         }
         let (original_line, original_column) = self.search_original_line_and_column(position);
-        self.update_generated_line_and_column(output);
         let name_id = name.map(|s| self.sourcemap_builder.add_name(s));
         self.sourcemap_builder.add_token(
-            self.generated_line,
-            self.generated_column,
+            generated_line,
+            generated_column,
             original_line,
             original_column,
             Some(self.source_id),
@@ -228,86 +231,6 @@ impl<'a> SourcemapBuilder<'a> {
         }
 
         idx
-    }
-
-    #[expect(clippy::cast_possible_truncation)]
-    fn update_generated_line_and_column(&mut self, output: &[u8]) {
-        const BATCH_SIZE: usize = 32;
-
-        let start_index = self.last_generated_update;
-
-        // Find last line break
-        let mut line_start_index = start_index;
-        let mut idx = line_start_index;
-        let mut last_line_is_ascii = true;
-
-        macro_rules! handle_byte {
-            ($byte:ident) => {
-                match $byte {
-                    b'\n' => {}
-                    b'\r' => {
-                        // Handle Windows-specific "\r\n" newlines
-                        if output.get(idx + 1) == Some(&b'\n') {
-                            idx += 1;
-                        }
-                    }
-                    _ if $byte.is_ascii() => {
-                        idx += 1;
-                        continue;
-                    }
-                    LS_OR_PS_FIRST_BYTE => {
-                        let next_byte = output[idx + 1];
-                        let next_next_byte = output[idx + 2];
-                        if !matches!([next_byte, next_next_byte], LS_LAST_2_BYTES | PS_LAST_2_BYTES)
-                        {
-                            last_line_is_ascii = false;
-                            idx += 1;
-                            continue;
-                        }
-                    }
-                    _ => {
-                        // Unicode char
-                        last_line_is_ascii = false;
-                        idx += 1;
-                        continue;
-                    }
-                }
-
-                // Line break found.
-                // `iter` is now positioned after line break.
-                line_start_index = idx + 1;
-                self.generated_line += 1;
-                self.generated_column = 0;
-                last_line_is_ascii = true;
-                idx += 1;
-            };
-        }
-
-        while let (end, overflow) = idx.overflowing_add(BATCH_SIZE)
-            && !overflow
-            && end < output.len()
-        {
-            while idx < end {
-                let b = output[idx];
-                handle_byte!(b);
-            }
-        }
-        while idx < output.len() {
-            let b = output[idx];
-            handle_byte!(b);
-        }
-
-        // Calculate column
-        self.generated_column += if last_line_is_ascii {
-            (output.len() - line_start_index) as u32
-        } else {
-            // TODO: It'd be better if could use `from_utf8_unchecked` here, but we'd need to make this
-            // function unsafe and caller guarantees `output` contains a valid UTF-8 string
-            let last_line = std::str::from_utf8(&output[line_start_index..]).unwrap();
-            // Mozilla's "source-map" library counts columns using UTF-16 code units
-            last_line.encode_utf16().count() as u32
-        };
-        self.last_generated_update = output.len();
     }
 
     fn generate_line_offset_tables(content: &str) -> LineOffsetTables {
@@ -512,47 +435,10 @@ mod test {
     }
 
     #[test]
-    fn add_source_mapping() {
-        fn create_mappings(source: &str, line: u32, column: u32) {
-            let mut builder = SourcemapBuilder::new(Path::new("x.js"), source);
-            let output: Vec<u8> = source.as_bytes().into();
-            for (i, _ch) in source.char_indices() {
-                #[expect(clippy::cast_possible_truncation)]
-                builder.add_source_mapping(&output, i as u32, None);
-                assert!(
-                    builder.generated_line == line && builder.generated_column == column,
-                    "Incorrect generated mapping for '{source}' ({:?}) starting at {i} - line {}, column {}",
-                    source.as_bytes(),
-                    builder.generated_line,
-                    builder.generated_column
-                );
-                assert_eq!(builder.last_generated_update, source.len());
-            }
-        }
-
-        create_mappings("", 0, 0);
-        create_mappings("abc", 0, 3);
-        create_mappings("\n", 1, 0);
-        create_mappings("\n\n\n", 3, 0);
-        create_mappings("\r", 1, 0);
-        create_mappings("\r\r\r", 3, 0);
-        create_mappings("\r\n", 1, 0);
-        create_mappings("\r\n\r\n\r\n", 3, 0);
-        create_mappings("\nabc", 1, 3);
-        create_mappings("abc\n", 1, 0);
-        create_mappings("\rabc", 1, 3);
-        create_mappings("abc\r", 1, 0);
-        create_mappings("\r\nabc", 1, 3);
-        create_mappings("abc\r\n", 1, 0);
-        create_mappings("ÖÖ\nÖ\nÖÖÖ", 2, 3);
-    }
-
-    #[test]
     fn add_source_mapping_for_name() {
-        let output = b"ac";
         let mut builder = SourcemapBuilder::new(Path::new("x.js"), "ab");
-        builder.add_source_mapping_for_name(output, Span::new(0, 1), "a");
-        builder.add_source_mapping_for_name(output, Span::new(1, 2), "c");
+        builder.add_source_mapping_for_name(0, 0, Span::new(0, 1), "a");
+        builder.add_source_mapping_for_name(0, 1, Span::new(1, 2), "c");
         let sm = builder.into_sourcemap();
         // The name `a` not change.
         assert_eq!(
@@ -568,10 +454,9 @@ mod test {
 
     #[test]
     fn add_source_mapping_for_unordered_position() {
-        let output = b"";
         let mut builder = SourcemapBuilder::new(Path::new("x.js"), "ab");
-        builder.add_source_mapping(output, 1, None);
-        builder.add_source_mapping(output, 0, None);
+        builder.add_source_mapping(0, 0, 1, None);
+        builder.add_source_mapping(0, 1, 0, None);
         let sm = builder.into_sourcemap();
         assert_eq!(sm.get_tokens().count(), 2);
     }
