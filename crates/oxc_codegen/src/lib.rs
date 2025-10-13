@@ -80,6 +80,10 @@ pub struct CodegenReturn {
 pub struct Codegen<'a> {
     pub(crate) options: CodegenOptions,
 
+    /// Cached copy of [`CodegenOptions::minify`] to avoid repeatedly dereferencing the options
+    /// struct on the hot path.
+    pub(crate) minify: bool,
+
     /// Original source code of the AST
     source_text: Option<&'a str>,
 
@@ -150,8 +154,10 @@ impl<'a> Codegen<'a> {
     #[must_use]
     pub fn new() -> Self {
         let options = CodegenOptions::default();
+        let minify = options.minify;
         Self {
             options,
+            minify,
             source_text: None,
             scoping: None,
             private_member_mappings: None,
@@ -181,6 +187,7 @@ impl<'a> Codegen<'a> {
     pub fn with_options(mut self, options: CodegenOptions) -> Self {
         self.quote = if options.single_quote { Quote::Single } else { Quote::Double };
         self.code = CodeBuffer::with_indent(options.indent_char, options.indent_width);
+        self.minify = options.minify;
         self.options = options;
         self
     }
@@ -394,7 +401,7 @@ impl<'a> Codegen<'a> {
 
     #[inline]
     fn print_soft_space(&mut self) {
-        if !self.options.minify {
+        if !self.minify {
             self.print_ascii_byte(b' ');
         }
     }
@@ -406,7 +413,7 @@ impl<'a> Codegen<'a> {
 
     #[inline]
     fn print_soft_newline(&mut self) {
-        if !self.options.minify {
+        if !self.minify {
             self.print_ascii_byte(b'\n');
         }
     }
@@ -457,14 +464,14 @@ impl<'a> Codegen<'a> {
 
     #[inline]
     fn indent(&mut self) {
-        if !self.options.minify {
+        if !self.minify {
             self.indent += 1;
         }
     }
 
     #[inline]
     fn dedent(&mut self) {
-        if !self.options.minify {
+        if !self.minify {
             self.indent -= 1;
         }
     }
@@ -499,7 +506,7 @@ impl<'a> Codegen<'a> {
 
     #[inline]
     fn print_indent(&mut self) {
-        if self.options.minify {
+        if self.minify {
             return;
         }
         if self.print_next_indent_as_space {
@@ -507,12 +514,15 @@ impl<'a> Codegen<'a> {
             self.print_next_indent_as_space = false;
             return;
         }
+        if self.indent == 0 {
+            return;
+        }
         self.code.print_indent(self.indent as usize);
     }
 
     #[inline]
     fn print_semicolon_after_statement(&mut self) {
-        if self.options.minify {
+        if self.minify {
             self.needs_semicolon = true;
         } else {
             self.print_str(";\n");
@@ -582,7 +592,7 @@ impl<'a> Codegen<'a> {
                 self.print_soft_newline();
             }
             stmt => {
-                if need_space && self.options.minify {
+                if need_space && self.minify {
                     self.print_hard_space();
                 }
                 self.print_next_indent_as_space = true;
@@ -617,7 +627,7 @@ impl<'a> Codegen<'a> {
         // Ensure first string literal is not a directive.
         let mut first_needs_parens = false;
         if directives.is_empty()
-            && !self.options.minify
+            && !self.minify
             && let Statement::ExpressionStatement(s) = first
         {
             let s = s.expression.without_parentheses();

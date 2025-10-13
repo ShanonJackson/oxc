@@ -515,6 +515,9 @@ impl CodeBuffer {
         }
 
         let bytes = depth * self.indent_width;
+        if bytes == 0 {
+            return;
+        }
 
         let len = self.len();
         let spare_capacity = self.capacity() - len;

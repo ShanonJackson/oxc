@@ -34,7 +34,7 @@ impl Codegen<'_> {
         // Don't print opening quote now, because we don't know what it is yet.
         //
         // If not in `minify` mode, print the quote requested in options.
-        let quote = if self.options.minify {
+        let quote = if self.minify {
             None
         } else {
             let quote = self.quote;
