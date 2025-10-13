@@ -2,15 +2,90 @@
 //!
 //! Reference: <https://github.com/evanw/esbuild/blob/78f89e41d5e8a7088f4820351c6305cc339f8820/internal/js_printer/js_printer.go#L3266>
 
-use std::ops::Not;
+use std::{mem::MaybeUninit, ops::Not};
 
 use oxc_ast::ast::{BinaryExpression, Expression, LogicalExpression};
+use oxc_data_structures::stack::Stack;
 use oxc_syntax::{
     operator::{BinaryOperator, LogicalOperator},
     precedence::{GetPrecedence, Precedence},
 };
 
 use crate::{Codegen, Context, Operator, r#gen::GenExpr};
+
+const INLINE_STACK_CAPACITY: usize = 8;
+
+pub(crate) struct BinaryExpressionStack<'a> {
+    inline: [MaybeUninit<BinaryExpressionVisitor<'a>>; INLINE_STACK_CAPACITY],
+    inline_len: u8,
+    spill: Stack<BinaryExpressionVisitor<'a>>,
+}
+
+impl<'a> BinaryExpressionStack<'a> {
+    pub fn new() -> Self {
+        Self {
+            inline: unsafe {
+                MaybeUninit::<[MaybeUninit<BinaryExpressionVisitor<'a>>; INLINE_STACK_CAPACITY]>::uninit()
+                    .assume_init()
+            },
+            inline_len: 0,
+            spill: Stack::new(),
+        }
+    }
+
+    pub fn with_spill_capacity(capacity: usize) -> Self {
+        let spill = if capacity == 0 { Stack::new() } else { Stack::with_capacity(capacity) };
+        Self {
+            inline: unsafe {
+                MaybeUninit::<[MaybeUninit<BinaryExpressionVisitor<'a>>; INLINE_STACK_CAPACITY]>::uninit()
+                    .assume_init()
+            },
+            inline_len: 0,
+            spill,
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.spill.len() + usize::from(self.inline_len)
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.inline_len = 0;
+        self.spill.clear();
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, value: BinaryExpressionVisitor<'a>) {
+        if usize::from(self.inline_len) < INLINE_STACK_CAPACITY {
+            self.inline[usize::from(self.inline_len)].write(value);
+            self.inline_len += 1;
+        } else {
+            self.spill.push(value);
+        }
+    }
+
+    #[inline(always)]
+    pub fn pop(&mut self) -> Option<BinaryExpressionVisitor<'a>> {
+        if let Some(value) = self.spill.pop() {
+            return Some(value);
+        }
+        if self.inline_len == 0 {
+            return None;
+        }
+        self.inline_len -= 1;
+        // SAFETY: slot was initialized when pushed and `inline_len` now
+        // points at that slot again.
+        Some(unsafe { self.inline[usize::from(self.inline_len)].assume_init() })
+    }
+}
+
+impl<'a> Default for BinaryExpressionStack<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum Binaryish<'a> {
