@@ -2513,16 +2513,20 @@ impl Gen for JSXElement<'_> {
         p.add_source_mapping(self.opening_element.span);
         p.print_ascii_byte(b'<');
         self.opening_element.name.print(p, ctx);
+        let minify = p.options.minify;
         for attr in &self.opening_element.attributes {
             match attr {
-                JSXAttributeItem::Attribute(_) => {
-                    p.print_hard_space();
+                JSXAttributeItem::Attribute(attr) => {
+                    p.print_ascii_byte(b' ');
+                    attr.print(p, ctx);
                 }
-                JSXAttributeItem::SpreadAttribute(_) => {
-                    p.print_soft_space();
+                JSXAttributeItem::SpreadAttribute(spread_attr) => {
+                    if !minify {
+                        p.print_ascii_byte(b' ');
+                    }
+                    spread_attr.print(p, ctx);
                 }
             }
-            attr.print(p, ctx);
         }
         if self.closing_element.is_none() {
             p.print_soft_space();

@@ -204,8 +204,9 @@ impl Codegen<'_> {
         }
     }
 
+    #[inline]
     pub(crate) fn has_comment(&self, start: u32) -> bool {
-        self.comments.contains_key(&start)
+        !self.comments.is_empty() && self.comments.contains_key(&start)
     }
 
     pub(crate) fn print_leading_comments(&mut self, start: u32) {
