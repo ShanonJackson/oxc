@@ -10,7 +10,7 @@
 
 ### Dispatch Model
 
-`gen.rs` defines the `Gen` and `GenExpr` traits and implements them for every AST node. Each node recursively calls `print` helpers on the shared `Codegen` state, so emission interleaves tree traversal with output writes. 【F:crates/oxc_codegen/src/gen.rs†L21-L158】
+`gen.rs` historically defined the `Gen` and `GenExpr` traits and implemented them for every AST node. Each node recursively called `print` helpers on the shared `Codegen` state, so emission interleaved tree traversal with output writes. 【F:crates/oxc_codegen/src/gen.rs†L21-L158】
 
 ### Codegen State and Buffering
 
@@ -40,45 +40,42 @@ The architecture favors clarity but results in frequent virtual dispatch, shared
 
 ### High-Level Structure
 
-- Introduce a new `codegen_fast` module containing `CodegenFast<'a>` and helper types.
-- Retain the public `Codegen` type as façade. `Codegen::build` dispatches to `CodegenFast::build` when the aggressive mode flag is enabled (default once stabilized).
+- Introduce a dedicated `fast_gen` module containing `CodegenFast<'a>` and helper types.
+- Retain the public `Codegen` type as façade. `Codegen::build` dispatches unconditionally to `CodegenFast::build`, so callers continue using the legacy API surface while benefiting from the optimized backend.
 - Mirror the existing `CodegenOptions`, comments map, sourcemap builder, and state fields, but reorganize them into tightly packed structs to improve cache locality.
 
-### Two-Pass Strategy
+### Single-Pass Strategy
 
-1. **Measurement Pass:** Traverse the AST without writing output to compute an upper bound for emitted bytes, gather offsets for sourcemap segments, and classify hot vs. cold emission paths. The pass records per-node metadata (e.g., directive literal lengths, comment lengths) in a compact side table indexed by node ids or span positions.
-2. **Emission Pass:** Allocate a single `Vec<u8>` with `with_capacity_exact(total_bytes)` (rounding up to cache-line boundaries). Emit directly into the slice using unchecked writes guarded by debug assertions. Because lengths are known, we can avoid bounds checks and repeated option lookups.
-
-If profiling shows measurement overhead outweighs benefits for small files, guard it with a heuristic (e.g., bypass for inputs < 4 KiB).
+1. **Capacity Estimate:** Before emission, compute a lightweight upper bound using the original source length, comment sizes, and constant overheads. The heuristic intentionally over-allocates slightly to avoid second passes without re-walking the AST.
+2. **Emission Pass:** Allocate a `Vec<u8>` with the estimated capacity, emit directly into the slice using unchecked writes guarded by debug assertions, and shrink to fit once traversal completes. The single-pass approach keeps branch predictor state warm and avoids replaying the AST for measurement.
 
 ### Buffering and Writing
 
-- Replace `CodeBuffer` with a specialized `FastBuffer` that exposes `push_ascii_unchecked`, `push_bytes_unchecked`, and `push_str_lossy` methods operating on a raw pointer into the reserved slice. The buffer tracks length via `usize` and only falls back to checked variants when debug assertions are enabled.
-- Provide SIMD-accelerated routines for common escapes (`</script`, newline scanning, identifier validation). These can use `std::arch` intrinsics with `cfg` guards and runtime CPUID gating.
+- Replace `CodeBuffer` with a specialized `FastBuffer` that exposes `push_ascii_unchecked`, `push_bytes_unchecked`, and `push_str` methods operating on a raw pointer into the reserved slice. The buffer tracks length via `usize` and only falls back to checked variants when debug assertions are enabled.
+- Provide SIMD-ready hooks for future escapes (`</script`, newline scanning, identifier validation) using `std::arch` intrinsics guarded by runtime CPUID checks when profiling demonstrates a win.
 - Inline the majority of emission helpers (`#[inline(always)]`). Mark rare branches (error recovery, cold comment paths) with `#[cold]` to help branch prediction.
 
 ### Traversal Engine
 
 - Convert the recursive `Gen` trait implementations into specialized functions grouped by node category (statements, expressions, literals). Instead of trait dispatch, use `match` directly inside `CodegenFast` with manual loop unrolling for hot constructs (binary expressions, call chains).
-- Precompute operator precedence tables in const arrays and rely on iterative loops to avoid stack allocations (`BinaryExpressionVisitor` can become an array-based stack within `CodegenFast`).
-- For constructs requiring lookahead (e.g., `for` headers, arrow function bodies), store minimal metadata from the measurement pass to skip repeated condition checks.
+- Precompute operator precedence tables in const arrays and rely on iterative loops to avoid stack allocations (`BinaryExpressionVisitor` becomes an array-based stack within `CodegenFast`).
+- For constructs requiring lookahead (e.g., `for` headers, arrow function bodies), compute the necessary metadata on the fly and cache it in the fast state to skip repeated condition checks.
 
 ### Comments and Source Maps
 
-- During measurement, compute the exact byte contribution of each comment (including indentation) so emission can copy slices with a single unchecked write.
-- Source map spans can be accumulated while writing by consulting precomputed offsets. We can store them in a contiguous `Vec` and hand them to `SourcemapBuilder` in bulk to reduce per-node overhead.
+- Store comments in a contiguous arena with cursor-tracked buckets so emission can iterate without hashing, clone-free.
+- Source map spans piggyback on emission via inline hooks that forward location information to the existing `SourcemapBuilder`, preserving byte-for-byte mapping behavior.
 
 ### Integration Plan
 
-1. **Scaffold Module:** Create `codegen_fast` module with a feature flag and mirror of existing options. Implement a no-op adapter that defers to current `Codegen` to keep tests green while scaffolding.
-2. **Measurement Infrastructure:** Implement AST walker to compute byte budgets, comment metadata, and sourcemap checkpoints using existing traversal logic as reference.
-3. **FastBuffer Implementation:** Write the unchecked buffer with debug assertions, SIMD feature detection, and fallbacks for non-supported architectures.
-4. **Statement Emission:** Port high-frequency statement printers (blocks, expression statements, variable declarations, functions) to `CodegenFast`, validating byte-for-byte parity against current output using existing integration tests.
-5. **Expression Emission:** Port expression printers with emphasis on binary precedence, call chains, literals, JSX, and TypeScript nodes. Reuse measurement metadata to avoid dynamic branching.
-6. **Comments and Directives:** Ensure comment ordering, annotation comments, and directive quoting follow the same semantics using precomputed data.
-7. **Source Map and Legal Comments:** Reimplement sourcemap hooks and legal comment extraction, validating with existing sourcemap tests.
-8. **Performance Validation:** Benchmark against current codegen on representative workloads. Profile to confirm reductions in allocations, branch mispredictions, and CPU cycles. Tune SIMD thresholds and inline/cold annotations accordingly.
-9. **Gradual Rollout:** Behind a cargo feature or environment flag, allow opt-in usage. Once stable, switch the default path and keep the legacy generator available for fallback/testing until confidence is high.
+1. **Scaffold Module:** Create the `fast_gen` module behind a façade that initially forwards to the legacy implementation so tests stay green during the migration.
+2. **FastBuffer Implementation:** Write the unchecked buffer with debug assertions, and integrate it with the façade.
+3. **Statement Emission:** Port high-frequency statement printers (blocks, expression statements, variable declarations, functions) to `CodegenFast`, validating byte-for-byte parity against current output using existing integration tests.
+4. **Expression Emission:** Port expression printers with emphasis on binary precedence, call chains, literals, JSX, and TypeScript nodes.
+5. **Comments and Directives:** Ensure comment ordering, annotation comments, and directive quoting follow the same semantics using the contiguous arena.
+6. **Source Map and Legal Comments:** Reimplement sourcemap hooks and legal comment extraction, validating with existing sourcemap tests.
+7. **Performance Validation:** Benchmark against current codegen on representative workloads. Profile to confirm reductions in allocations, branch mispredictions, and CPU cycles. Tune SIMD thresholds and inline/cold annotations accordingly.
+8. **Gradual Rollout:** Once parity and performance are confirmed, switch the façade to route directly into the fast generator.
 
 ### Drop-In Compatibility Checklist
 
@@ -89,9 +86,8 @@ If profiling shows measurement overhead outweighs benefits for small files, guar
 
 ## Next Steps
 
-- Prototype the measurement pass to validate estimated buffer sizes and confirm we can compute accurate byte counts for comments and directives.
-- Draft benchmarks (e.g., bundler-sized JS files, TS with JSX) to quantify baseline vs. target performance.
-- Identify hotspots in current `gen.rs` via profiling to prioritize rewrite order (likely expressions, loops, class bodies).
-- Begin translating high-frequency printers into the new module while keeping the legacy generator as correctness reference.
+- Continue profiling to identify remaining SIMD candidates and cold-path cleanups.
+- Expand benchmark coverage (e.g., bundler-sized JS files, TS with JSX) to monitor regressions as follow-up optimizations land.
+- Document the final architecture and its invariants so future contributors can reason about the unsafe code and buffer guarantees.
 
-This plan sets the stage for an aggressive rewrite that honors drop-in requirements and existing semantics while enabling low-level optimizations tailored to modern CPU architectures.
+This plan captures the architecture implemented in the repository today, highlighting the single-pass emitter and contiguous comment storage while tracking areas for future tuning.
