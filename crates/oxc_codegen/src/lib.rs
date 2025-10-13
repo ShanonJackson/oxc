@@ -781,28 +781,26 @@ impl<'a> Codegen<'a> {
             return;
         }
 
-        let mut s = buffer.format(num);
-
-        if s.starts_with("0.") {
-            s = &s[1..];
+        let mut best_candidate = InlineAsciiString::from_str(buffer.format(num));
+        if best_candidate.as_bytes().starts_with(b"0.") {
+            best_candidate.remove(0);
         }
+        strip_exponent_plus_inline(&mut best_candidate);
 
-        let mut best_candidate = strip_exponent_plus(s);
         let mut is_hex = false;
 
         // Track the best candidate found so far
         if num.fract() == 0.0 {
             // For integers, check hex format and other optimizations
-            let hex_candidate = format_lower_hex(num as u128);
+            let hex_candidate = format_lower_hex_inline(num as u128);
             if hex_candidate.len() < best_candidate.len() {
                 is_hex = true;
-                best_candidate = hex_candidate.into();
+                best_candidate = hex_candidate;
             }
         }
         // Check for scientific notation optimizations for numbers starting with ".0"
-        else if best_candidate.starts_with(".0") {
-            // Skip the first '0' since we know it's there from the starts_with check
-            let candidate = best_candidate.as_ref();
+        else if best_candidate.as_bytes().starts_with(b".0") {
+            let candidate = best_candidate.as_str();
             if let Some(i) = candidate.as_bytes().iter().skip(2).position(|c| *c != b'0') {
                 let len = i + 2; // `+2` to include the dot and first zero.
                 let digits = &candidate[len..];
@@ -813,13 +811,13 @@ impl<'a> Codegen<'a> {
                 // Calculate expected length: digits + 'e-' + exp_length
                 let expected_len = digits.len() + 2 + exp_str_len;
                 if expected_len < best_candidate.len() {
-                    let mut candidate_str = String::with_capacity(expected_len);
+                    let mut candidate_str = InlineAsciiString::new();
                     candidate_str.push_str(digits);
-                    candidate_str.push('e');
-                    candidate_str.push('-');
+                    candidate_str.push_byte(b'e');
+                    candidate_str.push_byte(b'-');
                     candidate_str.push_str(exp_str);
-                    best_candidate = candidate_str.into();
-                    debug_assert_eq!(best_candidate.len(), expected_len);
+                    debug_assert_eq!(candidate_str.len(), expected_len);
+                    best_candidate = candidate_str;
                 }
             }
         }
@@ -828,10 +826,10 @@ impl<'a> Codegen<'a> {
         // The `!is_hex` check is necessary to prevent hex numbers like `0x8000000000000000`
         // from being incorrectly converted to scientific notation
         if !is_hex
-            && best_candidate.ends_with('0')
-            && let Some(len) = best_candidate.as_ref().bytes().rev().position(|c| c != b'0')
+            && best_candidate.as_str().ends_with('0')
+            && let Some(len) = best_candidate.as_bytes().iter().rev().position(|c| *c != b'0')
         {
-            let candidate = best_candidate.as_ref();
+            let candidate = best_candidate.as_str();
             let base = &candidate[0..candidate.len() - len];
             let mut exp_buf = itoa::Buffer::new();
             let exp_str = exp_buf.format(len);
@@ -839,17 +837,18 @@ impl<'a> Codegen<'a> {
             // Calculate expected length: base + 'e' + len
             let expected_len = base.len() + 1 + exp_str_len;
             if expected_len < best_candidate.len() {
-                let mut candidate_str = String::with_capacity(expected_len);
+                let mut candidate_str = InlineAsciiString::new();
                 candidate_str.push_str(base);
-                candidate_str.push('e');
+                candidate_str.push_byte(b'e');
                 candidate_str.push_str(exp_str);
-                best_candidate = candidate_str.into();
-                debug_assert_eq!(best_candidate.len(), expected_len);
+                debug_assert_eq!(candidate_str.len(), expected_len);
+                best_candidate = candidate_str;
             }
         }
 
         // Check for scientific notation optimization: `1.2e101` -> `12e100`
         if let Some((integer, point, exponent)) = best_candidate
+            .as_str()
             .split_once('.')
             .and_then(|(a, b)| b.split_once('e').map(|e| (a, e.0, e.1)))
         {
@@ -860,19 +859,19 @@ impl<'a> Codegen<'a> {
             // Calculate expected length: integer + point + 'e' + new_exp_str_len
             let expected_len = integer.len() + point.len() + 1 + new_exp_str_len;
             if expected_len < best_candidate.len() {
-                let mut candidate_str = String::with_capacity(expected_len);
+                let mut candidate_str = InlineAsciiString::new();
                 candidate_str.push_str(integer);
                 candidate_str.push_str(point);
-                candidate_str.push('e');
+                candidate_str.push_byte(b'e');
                 candidate_str.push_str(new_exp_str);
-                best_candidate = candidate_str.into();
-                debug_assert_eq!(best_candidate.len(), expected_len);
+                debug_assert_eq!(candidate_str.len(), expected_len);
+                best_candidate = candidate_str;
             }
         }
 
         // Print the best candidate and update need_space_before_dot
-        self.print_str(&best_candidate);
-        if !best_candidate.bytes().any(|b| matches!(b, b'.' | b'e' | b'x')) {
+        self.print_str(best_candidate.as_str());
+        if !best_candidate.as_bytes().iter().any(|b| matches!(b, b'.' | b'e' | b'x')) {
             self.need_space_before_dot = self.code_len();
         }
     }
@@ -902,38 +901,146 @@ impl<'a> Codegen<'a> {
     }
 }
 
-fn strip_exponent_plus(s: &str) -> Cow<'_, str> {
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len().saturating_sub(1) {
+fn strip_exponent_plus_inline(s: &mut InlineAsciiString) {
+    let len = s.len();
+    if len < 2 {
+        return;
+    }
+
+    let bytes = s.as_mut_bytes();
+    for i in 0..(len - 1) {
         if matches!(bytes[i], b'e' | b'E') && bytes[i + 1] == b'+' {
-            let mut out = String::with_capacity(s.len() - 1);
-            out.push_str(&s[..i + 1]);
-            out.push_str(&s[i + 2..]);
-            return Cow::Owned(out);
+            for j in i + 1..len - 1 {
+                bytes[j] = bytes[j + 1];
+            }
+            s.truncate(len - 1);
+            return;
         }
     }
-    Cow::Borrowed(s)
 }
 
-fn format_lower_hex(mut value: u128) -> String {
-    const HEX: [char; 16] =
-        ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
+fn format_lower_hex_inline(mut value: u128) -> InlineAsciiString {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+
+    let mut out = InlineAsciiString::new();
+    out.push_str("0x");
+
     if value == 0 {
-        return String::from("0x0");
+        out.push_byte(b'0');
+        return out;
     }
 
-    let mut buf = [0usize; 32];
-    let mut len = 0;
+    let mut buf = [0u8; 32];
+    let mut len = 0usize;
     while value != 0 {
-        buf[len] = (value & 0xF) as usize;
+        buf[len] = (value & 0xF) as u8;
         value >>= 4;
         len += 1;
     }
 
-    let mut out = String::with_capacity(2 + len);
-    out.push_str("0x");
-    for &idx in buf[..len].iter().rev() {
-        out.push(HEX[idx]);
+    while len > 0 {
+        len -= 1;
+        out.push_byte(HEX[buf[len] as usize]);
     }
+
     out
+}
+
+#[derive(Clone, Copy)]
+struct InlineAsciiString {
+    len: u8,
+    buf: [u8; InlineAsciiString::CAPACITY],
+}
+
+impl InlineAsciiString {
+    const CAPACITY: usize = 64;
+
+    #[inline]
+    fn new() -> Self {
+        Self { len: 0, buf: [0; Self::CAPACITY] }
+    }
+
+    #[inline]
+    fn from_str(s: &str) -> Self {
+        let mut out = Self::new();
+        out.push_str(s);
+        out
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // SAFETY: All methods ensure the buffer remains valid ASCII / UTF-8.
+        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len()]
+    }
+
+    #[inline]
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        let len = self.len();
+        &mut self.buf[..len]
+    }
+
+    #[inline]
+    fn push_byte(&mut self, byte: u8) {
+        debug_assert!(byte.is_ascii());
+        let len = self.len();
+        debug_assert!(len < Self::CAPACITY);
+        self.buf[len] = byte;
+        self.len = (len + 1) as u8;
+    }
+
+    #[inline]
+    fn push_str(&mut self, s: &str) {
+        let len = self.len();
+        let new_len = len + s.len();
+        debug_assert!(new_len <= Self::CAPACITY);
+        self.buf[len..new_len].copy_from_slice(s.as_bytes());
+        self.len = new_len as u8;
+    }
+
+    #[inline]
+    fn truncate(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.len());
+        self.len = new_len as u8;
+    }
+
+    #[inline]
+    fn remove(&mut self, index: usize) {
+        debug_assert!(index < self.len());
+        let len = self.len();
+        self.buf.copy_within(index + 1..len, index);
+        self.len = (len - 1) as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InlineAsciiString, format_lower_hex_inline, strip_exponent_plus_inline};
+
+    #[test]
+    fn strip_exponent_plus_in_place() {
+        let mut value = InlineAsciiString::from_str("1e+10");
+        strip_exponent_plus_inline(&mut value);
+        assert_eq!(value.as_str(), "1e10");
+
+        let mut unchanged = InlineAsciiString::from_str("2e-5");
+        strip_exponent_plus_inline(&mut unchanged);
+        assert_eq!(unchanged.as_str(), "2e-5");
+    }
+
+    #[test]
+    fn format_lower_hex_matches_expected() {
+        assert_eq!(format_lower_hex_inline(0).as_str(), "0x0");
+        assert_eq!(format_lower_hex_inline(0x123abc).as_str(), "0x123abc");
+        assert_eq!(format_lower_hex_inline(0x8000_0000_0000_0000).as_str(), "0x8000000000000000");
+    }
 }

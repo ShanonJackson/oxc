@@ -40,60 +40,138 @@ impl<'a> Iterator for LineTerminatorSplitter<'a> {
             return None;
         }
 
-        for (index, &byte) in self.text.as_bytes().iter().enumerate() {
-            match byte {
-                b'\n' => {
-                    // SAFETY: Byte at `index` is `\n`, so `index` and `index + 1` are both UTF-8 char boundaries.
-                    // Therefore, slices up to `index` and from `index + 1` are both valid `&str`s.
-                    unsafe {
-                        let line = self.text.get_unchecked(..index);
-                        self.text = self.text.get_unchecked(index + 1..);
-                        return Some(line);
-                    }
-                }
-                b'\r' => {
-                    // SAFETY: Byte at `index` is `\r`, so `index` is on a UTF-8 char boundary
-                    let line = unsafe { self.text.get_unchecked(..index) };
-                    // If the next byte is `\n`, consume it as well
-                    let skip_bytes =
-                        if self.text.as_bytes().get(index + 1) == Some(&b'\n') { 2 } else { 1 };
-                    // SAFETY: `index + skip_bytes` is after `\r` or `\n`, so on a UTF-8 char boundary.
-                    // Therefore slice from `index + skip_bytes` is a valid `&str`.
-                    self.text = unsafe { self.text.get_unchecked(index + skip_bytes..) };
-                    return Some(line);
-                }
-                LS_OR_PS_FIRST_BYTE => {
-                    let next2: [u8; 2] = {
-                        // SAFETY: 0xE2 is always the start of a 3-byte Unicode character,
-                        // so there must be 2 more bytes available to consume
-                        let next2 =
-                            unsafe { self.text.as_bytes().get_unchecked(index + 1..index + 3) };
-                        next2.try_into().unwrap()
-                    };
-                    // If this is LS or PS, treat it as a line terminator
-                    if matches!(next2, LS_LAST_2_BYTES | PS_LAST_2_BYTES) {
-                        // SAFETY: `index` is the start of a 3-byte Unicode character,
-                        // so `index` and `index + 3` are both UTF-8 char boundaries.
-                        // Therefore, slices up to `index` and from `index + 3` are both valid `&str`s.
-                        unsafe {
-                            let line = self.text.get_unchecked(..index);
-                            self.text = self.text.get_unchecked(index + 3..);
-                            return Some(line);
-                        }
-                    }
-                }
-                _ => {}
+        let bytes = self.text.as_bytes();
+        let ascii_index = find_ascii_break(bytes);
+        let ls_index = find_unicode_break(bytes);
+
+        match (ascii_index, ls_index) {
+            (Some(i), Some(j)) if j < i => split_on_ls(self, j),
+            (Some(i), Some(_)) | (Some(i), None) => split_on_ascii(self, i),
+            (None, Some(j)) => split_on_ls(self, j),
+            (None, None) => {
+                let line = self.text;
+                self.text = "";
+                Some(line)
             }
         }
-
-        // No line break found - return the remaining text. Next call will return `None`.
-        let line = self.text;
-        self.text = "";
-        Some(line)
     }
 }
 
 impl FusedIterator for LineTerminatorSplitter<'_> {}
+
+#[inline]
+fn split_on_ascii<'a>(splitter: &mut LineTerminatorSplitter<'a>, index: usize) -> Option<&'a str> {
+    let bytes = splitter.text.as_bytes();
+    match bytes[index] {
+        b'\n' => unsafe {
+            let line = splitter.text.get_unchecked(..index);
+            splitter.text = splitter.text.get_unchecked(index + 1..);
+            Some(line)
+        },
+        b'\r' => {
+            let line = unsafe { splitter.text.get_unchecked(..index) };
+            let skip = if bytes.get(index + 1) == Some(&b'\n') { 2 } else { 1 };
+            splitter.text = unsafe { splitter.text.get_unchecked(index + skip..) };
+            Some(line)
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[inline]
+fn split_on_ls<'a>(splitter: &mut LineTerminatorSplitter<'a>, index: usize) -> Option<&'a str> {
+    unsafe {
+        let line = splitter.text.get_unchecked(..index);
+        splitter.text = splitter.text.get_unchecked(index + 3..);
+        Some(line)
+    }
+}
+
+fn find_unicode_break(bytes: &[u8]) -> Option<usize> {
+    let mut search = bytes;
+    let mut offset = 0usize;
+
+    while let Some(index) = find_byte(search, LS_OR_PS_FIRST_BYTE) {
+        let candidate = offset + index;
+        if candidate + 2 >= bytes.len() {
+            break;
+        }
+        let next2 = [bytes[candidate + 1], bytes[candidate + 2]];
+        if matches!(next2, LS_LAST_2_BYTES | PS_LAST_2_BYTES) {
+            return Some(candidate);
+        }
+        let next_start = index + 1;
+        search = &search[next_start..];
+        offset += next_start;
+    }
+
+    None
+}
+
+fn find_ascii_break(bytes: &[u8]) -> Option<usize> {
+    const BYTE_REPEAT: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    const NL_REPEATED: u64 = u64::from_ne_bytes([b'\n'; 8]);
+    const CR_REPEATED: u64 = u64::from_ne_bytes([b'\r'; 8]);
+
+    let ptr = bytes.as_ptr();
+    let len = bytes.len();
+    let mut index = 0usize;
+
+    while index + 8 <= len {
+        let chunk = unsafe { ptr.add(index).cast::<u64>().read_unaligned() };
+        let nl_diff = chunk ^ NL_REPEATED;
+        let nl_matches = nl_diff.wrapping_sub(BYTE_REPEAT) & !nl_diff & HIGH_BITS;
+        let cr_diff = chunk ^ CR_REPEATED;
+        let cr_matches = cr_diff.wrapping_sub(BYTE_REPEAT) & !cr_diff & HIGH_BITS;
+        let combined = nl_matches | cr_matches;
+        if combined != 0 {
+            let offset = (combined.trailing_zeros() as usize) >> 3;
+            return Some(index + offset);
+        }
+        index += 8;
+    }
+
+    while index < len {
+        let byte = unsafe { *ptr.add(index) };
+        if byte == b'\n' || byte == b'\r' {
+            return Some(index);
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn find_byte(bytes: &[u8], target: u8) -> Option<usize> {
+    const BYTE_REPEAT: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    let repeated = u64::from_ne_bytes([target; 8]);
+
+    let ptr = bytes.as_ptr();
+    let len = bytes.len();
+    let mut index = 0usize;
+
+    while index + 8 <= len {
+        let chunk = unsafe { ptr.add(index).cast::<u64>().read_unaligned() };
+        let diff = chunk ^ repeated;
+        let matches = diff.wrapping_sub(BYTE_REPEAT) & !diff & HIGH_BITS;
+        if matches != 0 {
+            let offset = (matches.trailing_zeros() as usize) >> 3;
+            return Some(index + offset);
+        }
+        index += 8;
+    }
+
+    while index < len {
+        if unsafe { *ptr.add(index) } == target {
+            return Some(index);
+        }
+        index += 1;
+    }
+
+    None
+}
 
 impl Codegen<'_> {
     pub(crate) fn build_comments(&mut self, comments: &[Comment]) {
