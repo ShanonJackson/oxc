@@ -4,16 +4,20 @@
 //! * [esbuild](https://github.com/evanw/esbuild/blob/v0.24.0/internal/js_printer/js_printer.go)
 
 #![warn(missing_docs)]
+#![expect(clippy::inline_always)]
+#![expect(clippy::undocumented_unsafe_blocks)]
 
 use std::{borrow::Cow, cmp, slice};
 
 use cow_utils::CowUtils;
+use memchr::memchr2;
 
 use oxc_ast::ast::*;
-use oxc_data_structures::{code_buffer::CodeBuffer, stack::Stack};
+use oxc_data_structures::stack::Stack;
 use oxc_index::IndexVec;
 use oxc_semantic::Scoping;
 use oxc_span::{CompactStr, GetSpan, Span};
+use oxc_syntax::identifier::{LS, PS};
 use oxc_syntax::{
     class::ClassId,
     identifier::{is_identifier_part, is_identifier_part_ascii},
@@ -25,23 +29,27 @@ use rustc_hash::FxHashMap;
 mod binary_expr_visitor;
 mod comment;
 mod context;
+mod fast_buffer;
+mod fast_gen;
 mod r#gen;
 mod operator;
 mod options;
 mod sourcemap_builder;
 mod str;
+mod utf8;
 
 use binary_expr_visitor::BinaryExpressionVisitor;
 use comment::CommentsMap;
+use fast_buffer::FastBuffer;
 use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
+use utf8::{decode_utf8_from_lead, utf8_lead_byte_width};
+
 use str::{Quote, cold_branch, is_script_close_tag};
 
 pub use context::Context;
 pub use r#gen::{Gen, GenExpr};
 pub use options::{CodegenOptions, CommentOptions, LegalComment};
-
-// Re-export `IndentChar` from `oxc_data_structures`
 pub use oxc_data_structures::code_buffer::IndentChar;
 
 /// Output from [`Codegen::build`]
@@ -89,7 +97,7 @@ pub struct Codegen<'a> {
     private_member_mappings: Option<IndexVec<ClassId, FxHashMap<String, CompactStr>>>,
 
     /// Output Code
-    code: CodeBuffer,
+    code: FastBuffer,
 
     // states
     prev_op_end: usize,
@@ -115,6 +123,14 @@ pub struct Codegen<'a> {
     /// Track the current indentation level
     indent: u32,
 
+    /// Current generated source position for sourcemap tracking
+    generated_line: u32,
+    generated_column: u32,
+
+    /// Tracks whether the previous byte was a carriage return so we can treat "\r\n"
+    /// as a single newline for sourcemap accounting.
+    pending_cr: bool,
+
     /// Fast path for [CodegenOptions::single_quote]
     quote: Quote,
 
@@ -122,6 +138,7 @@ pub struct Codegen<'a> {
     comments: CommentsMap,
 
     sourcemap_builder: Option<SourcemapBuilder<'a>>,
+    track_sourcemap: bool,
 }
 
 impl Default for Codegen<'_> {
@@ -155,7 +172,7 @@ impl<'a> Codegen<'a> {
             source_text: None,
             scoping: None,
             private_member_mappings: None,
-            code: CodeBuffer::default(),
+            code: FastBuffer::new(),
             needs_semicolon: false,
             need_space_before_dot: 0,
             print_next_indent_as_space: false,
@@ -170,9 +187,13 @@ impl<'a> Codegen<'a> {
             start_of_default_export: 0,
             is_jsx: false,
             indent: 0,
+            generated_line: 0,
+            generated_column: 0,
+            pending_cr: false,
             quote: Quote::Double,
             comments: CommentsMap::default(),
             sourcemap_builder: None,
+            track_sourcemap: false,
         }
     }
 
@@ -180,8 +201,11 @@ impl<'a> Codegen<'a> {
     #[must_use]
     pub fn with_options(mut self, options: CodegenOptions) -> Self {
         self.quote = if options.single_quote { Quote::Single } else { Quote::Double };
-        self.code = CodeBuffer::with_indent(options.indent_char, options.indent_width);
+        self.code = FastBuffer::with_indent(options.indent_char, options.indent_width);
         self.options = options;
+        self.generated_line = 0;
+        self.generated_column = 0;
+        self.pending_cr = false;
         self
     }
 
@@ -221,12 +245,9 @@ impl<'a> Codegen<'a> {
     pub fn build(mut self, program: &Program<'a>) -> CodegenReturn {
         self.quote = if self.options.single_quote { Quote::Single } else { Quote::Double };
         self.source_text = Some(program.source_text);
-        self.indent = self.options.initial_indent;
-        self.code.reserve(program.source_text.len());
-        self.build_comments(&program.comments);
-        if let Some(path) = &self.options.source_map_path {
-            self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));
-        }
+        let estimated_capacity = Self::estimate_emit_capacity(program);
+        self.prepare_pass(program, estimated_capacity);
+
         program.print(&mut self, Context::default());
         let legal_comments = self.handle_eof_linked_or_external_comments(program);
         let code = self.code.into_string();
@@ -251,15 +272,27 @@ impl<'a> Codegen<'a> {
     ///
     /// # Panics
     /// Panics if `byte` is not an ASCII byte (`0 - 0x7F`).
-    #[inline]
+    #[inline(always)]
     pub fn print_ascii_byte(&mut self, byte: u8) {
+        self.advance_ascii_byte(byte);
         self.code.print_ascii_byte(byte);
     }
 
     /// Push str into the buffer
-    #[inline]
+    #[inline(always)]
     pub fn print_str(&mut self, s: &str) {
+        self.advance_str(s);
         self.code.print_str(s);
+    }
+
+    /// Print a static ASCII keyword directly into the buffer.
+    #[inline(always)]
+    pub fn print_keyword(&mut self, keyword: &'static [u8]) {
+        debug_assert!(keyword.iter().all(u8::is_ascii));
+        self.advance_ascii_bytes(keyword.len());
+        unsafe {
+            self.code.print_bytes_unchecked(keyword);
+        }
     }
 
     /// Push str into the buffer, escaping `</script` to `<\/script`.
@@ -302,7 +335,8 @@ impl<'a> Codegen<'a> {
                         unsafe {
                             let index = ptr.offset_from_unsigned(bytes.as_ptr());
                             let before = bytes.get_unchecked(consumed..=index);
-                            self.code.print_bytes_unchecked(before);
+                            let before_str = std::str::from_utf8_unchecked(before);
+                            self.print_str(before_str);
 
                             // Set `consumed` to after `/`
                             consumed = index + 2;
@@ -370,7 +404,8 @@ impl<'a> Codegen<'a> {
         // SAFETY: `consumed` is either 0, or after `/`, so on a UTF-8 char boundary, and in bounds
         unsafe {
             let remaining = bytes.get_unchecked(consumed..);
-            self.code.print_bytes_unchecked(remaining);
+            let remaining_str = std::str::from_utf8_unchecked(remaining);
+            self.print_str(remaining_str);
         }
     }
 
@@ -384,7 +419,7 @@ impl<'a> Codegen<'a> {
 
 // Private APIs
 impl<'a> Codegen<'a> {
-    fn code(&self) -> &CodeBuffer {
+    fn code(&self) -> &FastBuffer {
         &self.code
     }
 
@@ -392,41 +427,210 @@ impl<'a> Codegen<'a> {
         self.code().len()
     }
 
+    fn reset_core_state(&mut self) {
+        self.needs_semicolon = false;
+        self.need_space_before_dot = 0;
+        self.print_next_indent_as_space = false;
+        self.prev_op_end = 0;
+        self.prev_reg_exp_end = 0;
+        self.prev_op = None;
+        self.start_of_stmt = 0;
+        self.start_of_arrow_expr = 0;
+        self.start_of_default_export = 0;
+        self.is_jsx = false;
+        self.indent = self.options.initial_indent;
+        self.binary_expr_stack.clear();
+        self.class_stack.clear();
+        self.next_class_id = ClassId::from_usize(0);
+        self.comments.clear();
+        self.code.clear();
+        self.generated_line = 0;
+        self.generated_column = 0;
+        self.pending_cr = false;
+        self.track_sourcemap = false;
+    }
+
+    fn prepare_pass(&mut self, program: &Program<'a>, capacity: usize) {
+        self.reset_core_state();
+        self.code.start_emission(capacity, self.options.indent_char, self.options.indent_width);
+        self.track_sourcemap = self.options.source_map_path.is_some();
+        if let Some(path) = &self.options.source_map_path {
+            self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));
+        } else {
+            self.sourcemap_builder = None;
+        }
+        self.build_comments(&program.comments);
+    }
+
+    #[inline(always)]
+    fn advance_ascii_byte(&mut self, byte: u8) {
+        if !self.track_sourcemap {
+            return;
+        }
+        match byte {
+            b'\r' => {
+                self.generated_line += 1;
+                self.generated_column = 0;
+                self.pending_cr = true;
+            }
+            b'\n' => {
+                if self.pending_cr {
+                    self.pending_cr = false;
+                } else {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
+                }
+            }
+            _ => {
+                self.generated_column += 1;
+                self.pending_cr = false;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn advance_ascii_bytes(&mut self, len: usize) {
+        if self.track_sourcemap && len != 0 {
+            self.generated_column += len as u32;
+            self.pending_cr = false;
+        }
+    }
+
+    #[inline(always)]
+    fn advance_str(&mut self, text: &str) {
+        if !self.track_sourcemap || text.is_empty() {
+            return;
+        }
+
+        let bytes = text.as_bytes();
+        if bytes.is_ascii() && memchr2(b'\r', b'\n', bytes).is_none() {
+            self.generated_column += bytes.len() as u32;
+            self.pending_cr = false;
+            return;
+        }
+        let len = bytes.len();
+        let mut idx = 0usize;
+        let mut pending_cr = self.pending_cr;
+        let ptr = bytes.as_ptr();
+
+        while idx < len {
+            let byte = unsafe { *ptr.add(idx) };
+            if byte < 0x80 {
+                match byte {
+                    b'\r' => {
+                        self.generated_line += 1;
+                        self.generated_column = 0;
+                        idx += 1;
+                        if idx < len && unsafe { *ptr.add(idx) } == b'\n' {
+                            idx += 1;
+                            pending_cr = false;
+                        } else {
+                            pending_cr = true;
+                        }
+                        continue;
+                    }
+                    b'\n' => {
+                        idx += 1;
+                        if pending_cr {
+                            pending_cr = false;
+                        } else {
+                            self.generated_line += 1;
+                            self.generated_column = 0;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        let start = idx;
+                        idx += 1;
+                        while idx < len {
+                            let b = unsafe { *ptr.add(idx) };
+                            if b >= 0x80 || b == b'\r' || b == b'\n' {
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        self.generated_column += (idx - start) as u32;
+                        pending_cr = false;
+                        continue;
+                    }
+                }
+            }
+
+            let width = utf8_lead_byte_width(byte);
+            debug_assert!(idx + width <= len);
+            let ch = unsafe { decode_utf8_from_lead(byte, ptr.add(idx + 1), width) };
+            idx += width;
+            match ch {
+                '\r' => {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
+                    pending_cr = true;
+                }
+                '\n' => {
+                    if pending_cr {
+                        pending_cr = false;
+                    } else {
+                        self.generated_line += 1;
+                        self.generated_column = 0;
+                    }
+                }
+                ch if ch == LS || ch == PS => {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
+                    pending_cr = false;
+                }
+                ch => {
+                    self.generated_column += ch.len_utf16() as u32;
+                    pending_cr = false;
+                }
+            }
+        }
+
+        self.pending_cr = pending_cr;
+    }
+
     #[inline]
+    fn estimate_emit_capacity(program: &Program<'_>) -> usize {
+        let base = program.source_text.len();
+        let comment_slack = program.comments.len() * 8;
+        base.saturating_add(comment_slack)
+    }
+
+    #[inline(always)]
     fn print_soft_space(&mut self) {
         if !self.options.minify {
             self.print_ascii_byte(b' ');
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_hard_space(&mut self) {
         self.print_ascii_byte(b' ');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_soft_newline(&mut self) {
         if !self.options.minify {
             self.print_ascii_byte(b'\n');
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_hard_newline(&mut self) {
         self.print_ascii_byte(b'\n');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_semicolon(&mut self) {
         self.print_ascii_byte(b';');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_comma(&mut self) {
         self.print_ascii_byte(b',');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_space_before_identifier(&mut self) {
         let Some(byte) = self.last_byte() else { return };
 
@@ -445,48 +649,48 @@ impl<'a> Codegen<'a> {
         self.print_hard_space();
     }
 
-    #[inline]
+    #[inline(always)]
     fn last_byte(&self) -> Option<u8> {
         self.code.last_byte()
     }
 
-    #[inline]
+    #[inline(always)]
     fn last_char(&self) -> Option<char> {
         self.code.last_char()
     }
 
-    #[inline]
+    #[inline(always)]
     fn indent(&mut self) {
         if !self.options.minify {
             self.indent += 1;
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn dedent(&mut self) {
         if !self.options.minify {
             self.indent -= 1;
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn enter_class(&mut self) {
         let class_id = self.next_class_id;
         self.next_class_id = ClassId::from_usize(self.next_class_id.index() + 1);
         self.class_stack.push(class_id);
     }
 
-    #[inline]
+    #[inline(always)]
     fn exit_class(&mut self) {
         self.class_stack.pop();
     }
 
-    #[inline]
+    #[inline(always)]
     fn current_class_ids(&self) -> impl Iterator<Item = ClassId> {
         self.class_stack.iter().rev().copied()
     }
 
-    #[inline]
+    #[inline(always)]
     fn wrap<F: FnMut(&mut Self)>(&mut self, wrap: bool, mut f: F) {
         if wrap {
             self.print_ascii_byte(b'(');
@@ -497,7 +701,7 @@ impl<'a> Codegen<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_indent(&mut self) {
         if self.options.minify {
             return;
@@ -507,10 +711,14 @@ impl<'a> Codegen<'a> {
             self.print_next_indent_as_space = false;
             return;
         }
+        if self.indent != 0 {
+            let width = self.options.indent_width.saturating_mul(self.indent as usize);
+            self.advance_ascii_bytes(width);
+        }
         self.code.print_indent(self.indent as usize);
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_semicolon_after_statement(&mut self) {
         if self.options.minify {
             self.needs_semicolon = true;
@@ -519,7 +727,7 @@ impl<'a> Codegen<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_semicolon_if_needed(&mut self) {
         if self.needs_semicolon {
             self.print_semicolon();
@@ -527,17 +735,17 @@ impl<'a> Codegen<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_ellipsis(&mut self) {
         self.print_str("...");
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_colon(&mut self) {
         self.print_ascii_byte(b':');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_equal(&mut self) {
         self.print_ascii_byte(b'=');
     }
@@ -881,7 +1089,12 @@ impl<'a> Codegen<'a> {
         if let Some(sourcemap_builder) = self.sourcemap_builder.as_mut()
             && !span.is_empty()
         {
-            sourcemap_builder.add_source_mapping(self.code.as_bytes(), span.start, None);
+            sourcemap_builder.add_source_mapping(
+                self.generated_line,
+                self.generated_column,
+                span.start,
+                None,
+            );
         }
     }
 
@@ -889,7 +1102,12 @@ impl<'a> Codegen<'a> {
         if let Some(sourcemap_builder) = self.sourcemap_builder.as_mut()
             && !span.is_empty()
         {
-            sourcemap_builder.add_source_mapping(self.code.as_bytes(), span.end, None);
+            sourcemap_builder.add_source_mapping(
+                self.generated_line,
+                self.generated_column,
+                span.end,
+                None,
+            );
         }
     }
 
@@ -897,7 +1115,61 @@ impl<'a> Codegen<'a> {
         if let Some(sourcemap_builder) = self.sourcemap_builder.as_mut()
             && !span.is_empty()
         {
-            sourcemap_builder.add_source_mapping_for_name(self.code.as_bytes(), span, name);
+            sourcemap_builder.add_source_mapping_for_name(
+                self.generated_line,
+                self.generated_column,
+                span,
+                name,
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn codegen_with_sourcemap() -> Codegen<'static> {
+        let mut codegen = Codegen::new();
+        codegen.sourcemap_builder = Some(SourcemapBuilder::new(Path::new("input.js"), ""));
+        codegen.track_sourcemap = true;
+        codegen
+    }
+
+    #[test]
+    fn tracks_ascii_bytes_and_newlines() {
+        let mut codegen = codegen_with_sourcemap();
+        codegen.print_ascii_byte(b'a');
+        assert_eq!((codegen.generated_line, codegen.generated_column), (0, 1));
+
+        codegen.print_ascii_byte(b'\n');
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 0));
+    }
+
+    #[test]
+    fn tracks_carriage_return_sequences() {
+        let mut codegen = codegen_with_sourcemap();
+        codegen.print_str("\r");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 0));
+
+        codegen.print_str("\n");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 0));
+
+        codegen.print_str("x");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 1));
+    }
+
+    #[test]
+    fn tracks_utf16_width_and_line_separators() {
+        let mut codegen = codegen_with_sourcemap();
+        codegen.print_str("🙂");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (0, 2));
+
+        codegen.print_str("\u{2028}");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 0));
+
+        codegen.print_str("\u{2029}z");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (2, 1));
     }
 }
