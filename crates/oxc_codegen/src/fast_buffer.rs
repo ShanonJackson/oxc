@@ -55,6 +55,9 @@ impl FastBuffer {
         if self.buf.capacity() < aligned_capacity {
             self.buf = Vec::with_capacity(aligned_capacity);
         }
+        unsafe {
+            self.buf.set_len(0);
+        }
         self.len = 0;
         self.indent_char = indent_char;
         self.indent_width = indent_width;
@@ -190,24 +193,40 @@ impl FastBuffer {
     pub fn clear(&mut self) {
         self.len = 0;
         self.tail_len = 0;
+        unsafe {
+            self.buf.set_len(0);
+        }
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
+        unsafe {
+            self.buf.set_len(self.len);
+        }
         self.update_tail(bytes);
         let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
             let target = new_len.next_power_of_two().max(64);
             let additional = target - self.buf.len();
-            self.buf.reserve(additional);
+            self.buf.reserve_exact(additional);
         }
+        debug_assert!(
+            self.buf.capacity() >= new_len,
+            "fast buffer capacity {} shorter than required {} (len {} bytes)",
+            self.buf.capacity(),
+            new_len,
+            bytes.len()
+        );
         unsafe {
             let dst = self.buf.as_mut_ptr().add(self.len);
             ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
         self.len = new_len;
+        unsafe {
+            self.buf.set_len(new_len);
+        }
     }
 
     fn update_tail(&mut self, bytes: &[u8]) {
