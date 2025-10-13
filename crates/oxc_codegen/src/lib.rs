@@ -4,13 +4,15 @@
 //! * [esbuild](https://github.com/evanw/esbuild/blob/v0.24.0/internal/js_printer/js_printer.go)
 
 #![warn(missing_docs)]
+#![expect(clippy::inline_always)]
+#![expect(clippy::undocumented_unsafe_blocks)]
 
 use std::{borrow::Cow, cmp, slice};
 
 use cow_utils::CowUtils;
 
 use oxc_ast::ast::*;
-use oxc_data_structures::{code_buffer::CodeBuffer, stack::Stack};
+use oxc_data_structures::stack::Stack;
 use oxc_index::IndexVec;
 use oxc_semantic::Scoping;
 use oxc_span::{CompactStr, GetSpan, Span};
@@ -25,6 +27,8 @@ use rustc_hash::FxHashMap;
 mod binary_expr_visitor;
 mod comment;
 mod context;
+mod fast_buffer;
+mod fast_gen;
 mod r#gen;
 mod operator;
 mod options;
@@ -33,15 +37,15 @@ mod str;
 
 use binary_expr_visitor::BinaryExpressionVisitor;
 use comment::CommentsMap;
+use fast_buffer::FastBuffer;
 use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
+
 use str::{Quote, cold_branch, is_script_close_tag};
 
 pub use context::Context;
 pub use r#gen::{Gen, GenExpr};
 pub use options::{CodegenOptions, CommentOptions, LegalComment};
-
-// Re-export `IndentChar` from `oxc_data_structures`
 pub use oxc_data_structures::code_buffer::IndentChar;
 
 /// Output from [`Codegen::build`]
@@ -89,7 +93,7 @@ pub struct Codegen<'a> {
     private_member_mappings: Option<IndexVec<ClassId, FxHashMap<String, CompactStr>>>,
 
     /// Output Code
-    code: CodeBuffer,
+    code: FastBuffer,
 
     // states
     prev_op_end: usize,
@@ -155,7 +159,7 @@ impl<'a> Codegen<'a> {
             source_text: None,
             scoping: None,
             private_member_mappings: None,
-            code: CodeBuffer::default(),
+            code: FastBuffer::new(),
             needs_semicolon: false,
             need_space_before_dot: 0,
             print_next_indent_as_space: false,
@@ -180,7 +184,7 @@ impl<'a> Codegen<'a> {
     #[must_use]
     pub fn with_options(mut self, options: CodegenOptions) -> Self {
         self.quote = if options.single_quote { Quote::Single } else { Quote::Double };
-        self.code = CodeBuffer::with_indent(options.indent_char, options.indent_width);
+        self.code = FastBuffer::with_indent(options.indent_char, options.indent_width);
         self.options = options;
         self
     }
@@ -221,12 +225,9 @@ impl<'a> Codegen<'a> {
     pub fn build(mut self, program: &Program<'a>) -> CodegenReturn {
         self.quote = if self.options.single_quote { Quote::Single } else { Quote::Double };
         self.source_text = Some(program.source_text);
-        self.indent = self.options.initial_indent;
-        self.code.reserve(program.source_text.len());
-        self.build_comments(&program.comments);
-        if let Some(path) = &self.options.source_map_path {
-            self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));
-        }
+        let estimated_capacity = Self::estimate_emit_capacity(program);
+        self.prepare_pass(program, estimated_capacity);
+
         program.print(&mut self, Context::default());
         let legal_comments = self.handle_eof_linked_or_external_comments(program);
         let code = self.code.into_string();
@@ -251,15 +252,24 @@ impl<'a> Codegen<'a> {
     ///
     /// # Panics
     /// Panics if `byte` is not an ASCII byte (`0 - 0x7F`).
-    #[inline]
+    #[inline(always)]
     pub fn print_ascii_byte(&mut self, byte: u8) {
         self.code.print_ascii_byte(byte);
     }
 
     /// Push str into the buffer
-    #[inline]
+    #[inline(always)]
     pub fn print_str(&mut self, s: &str) {
         self.code.print_str(s);
+    }
+
+    /// Print a static ASCII keyword directly into the buffer.
+    #[inline(always)]
+    pub fn print_keyword(&mut self, keyword: &'static [u8]) {
+        debug_assert!(keyword.iter().all(u8::is_ascii));
+        unsafe {
+            self.code.print_bytes_unchecked(keyword);
+        }
     }
 
     /// Push str into the buffer, escaping `</script` to `<\/script`.
@@ -384,7 +394,7 @@ impl<'a> Codegen<'a> {
 
 // Private APIs
 impl<'a> Codegen<'a> {
-    fn code(&self) -> &CodeBuffer {
+    fn code(&self) -> &FastBuffer {
         &self.code
     }
 
@@ -392,41 +402,78 @@ impl<'a> Codegen<'a> {
         self.code().len()
     }
 
+    fn reset_core_state(&mut self) {
+        self.needs_semicolon = false;
+        self.need_space_before_dot = 0;
+        self.print_next_indent_as_space = false;
+        self.prev_op_end = 0;
+        self.prev_reg_exp_end = 0;
+        self.prev_op = None;
+        self.start_of_stmt = 0;
+        self.start_of_arrow_expr = 0;
+        self.start_of_default_export = 0;
+        self.is_jsx = false;
+        self.indent = self.options.initial_indent;
+        self.binary_expr_stack.clear();
+        self.class_stack.clear();
+        self.next_class_id = ClassId::from_usize(0);
+        self.comments.clear();
+        self.code.clear();
+    }
+
+    fn prepare_pass(&mut self, program: &Program<'a>, capacity: usize) {
+        self.reset_core_state();
+        self.code.start_emission(capacity, self.options.indent_char, self.options.indent_width);
+        if let Some(path) = &self.options.source_map_path {
+            self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));
+        } else {
+            self.sourcemap_builder = None;
+        }
+        self.build_comments(&program.comments);
+    }
+
     #[inline]
+    fn estimate_emit_capacity(program: &Program<'_>) -> usize {
+        let base = program.source_text.len();
+        let comment_slack = program.comments.len() * 8;
+        base.saturating_add(comment_slack)
+    }
+
+    #[inline(always)]
     fn print_soft_space(&mut self) {
         if !self.options.minify {
             self.print_ascii_byte(b' ');
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_hard_space(&mut self) {
         self.print_ascii_byte(b' ');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_soft_newline(&mut self) {
         if !self.options.minify {
             self.print_ascii_byte(b'\n');
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_hard_newline(&mut self) {
         self.print_ascii_byte(b'\n');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_semicolon(&mut self) {
         self.print_ascii_byte(b';');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_comma(&mut self) {
         self.print_ascii_byte(b',');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_space_before_identifier(&mut self) {
         let Some(byte) = self.last_byte() else { return };
 
@@ -445,48 +492,48 @@ impl<'a> Codegen<'a> {
         self.print_hard_space();
     }
 
-    #[inline]
+    #[inline(always)]
     fn last_byte(&self) -> Option<u8> {
         self.code.last_byte()
     }
 
-    #[inline]
+    #[inline(always)]
     fn last_char(&self) -> Option<char> {
         self.code.last_char()
     }
 
-    #[inline]
+    #[inline(always)]
     fn indent(&mut self) {
         if !self.options.minify {
             self.indent += 1;
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn dedent(&mut self) {
         if !self.options.minify {
             self.indent -= 1;
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn enter_class(&mut self) {
         let class_id = self.next_class_id;
         self.next_class_id = ClassId::from_usize(self.next_class_id.index() + 1);
         self.class_stack.push(class_id);
     }
 
-    #[inline]
+    #[inline(always)]
     fn exit_class(&mut self) {
         self.class_stack.pop();
     }
 
-    #[inline]
+    #[inline(always)]
     fn current_class_ids(&self) -> impl Iterator<Item = ClassId> {
         self.class_stack.iter().rev().copied()
     }
 
-    #[inline]
+    #[inline(always)]
     fn wrap<F: FnMut(&mut Self)>(&mut self, wrap: bool, mut f: F) {
         if wrap {
             self.print_ascii_byte(b'(');
@@ -497,7 +544,7 @@ impl<'a> Codegen<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_indent(&mut self) {
         if self.options.minify {
             return;
@@ -510,7 +557,7 @@ impl<'a> Codegen<'a> {
         self.code.print_indent(self.indent as usize);
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_semicolon_after_statement(&mut self) {
         if self.options.minify {
             self.needs_semicolon = true;
@@ -519,7 +566,7 @@ impl<'a> Codegen<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_semicolon_if_needed(&mut self) {
         if self.needs_semicolon {
             self.print_semicolon();
@@ -527,17 +574,17 @@ impl<'a> Codegen<'a> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_ellipsis(&mut self) {
         self.print_str("...");
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_colon(&mut self) {
         self.print_ascii_byte(b':');
     }
 
-    #[inline]
+    #[inline(always)]
     fn print_equal(&mut self) {
         self.print_ascii_byte(b'=');
     }
