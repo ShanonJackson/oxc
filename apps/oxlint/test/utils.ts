@@ -1,3 +1,4 @@
+import { access } from 'node:fs/promises';
 import { join as pathJoin } from 'node:path';
 
 import { execa } from 'execa';
@@ -5,10 +6,13 @@ import { expect } from 'vitest';
 
 export const PACKAGE_ROOT_PATH = pathJoin(import.meta.dirname, '..');
 export const FIXTURES_DIR_PATH = pathJoin(import.meta.dirname, 'fixtures');
+const DIST_CLI_PATH = pathJoin(PACKAGE_ROOT_PATH, 'dist/cli.js');
 
 const REPO_ROOT_PATH = pathJoin(PACKAGE_ROOT_PATH, '../../');
 const ROOT_URL = new URL('../../../', import.meta.url).href;
 const FIXTURES_URL = new URL('./fixtures/', import.meta.url).href;
+
+let ensureDistPromise: Promise<void> | undefined;
 
 // Options to pass to `testFixtureWithCommand`.
 interface TestFixtureOptions {
@@ -31,6 +35,8 @@ interface TestFixtureOptions {
 export async function testFixtureWithCommand(options: TestFixtureOptions): Promise<void> {
   const fixtureDirPath = pathJoin(FIXTURES_DIR_PATH, options.fixtureName);
 
+  await ensureDist();
+
   let { stdout, stderr, exitCode } = await execa(options.command, options.args, {
     cwd: fixtureDirPath,
     reject: false,
@@ -52,6 +58,22 @@ export async function testFixtureWithCommand(options: TestFixtureOptions): Promi
   }
 
   await expect(snapshot).toMatchFileSnapshot(snapshotPath);
+}
+
+async function ensureDist(): Promise<void> {
+  if (!ensureDistPromise) {
+    ensureDistPromise = (async () => {
+      try {
+        await access(DIST_CLI_PATH);
+      } catch {
+        await execa('pnpm', ['run', 'build-test'], {
+          cwd: PACKAGE_ROOT_PATH,
+          stdio: 'inherit',
+        });
+      }
+    })();
+  }
+  await ensureDistPromise;
 }
 
 /**

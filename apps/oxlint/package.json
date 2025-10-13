@@ -13,7 +13,8 @@
     "build-napi-test": "pnpm run build-napi --features force_test_reporter",
     "build-napi-release": "pnpm run build-napi --release --features allocator",
     "build-js": "node scripts/build.js",
-    "test": "pnpm run build-test && tsc && vitest --dir ./test run"
+    "pretest": "pnpm run build-test",
+    "test": "tsc && vitest --dir ./test run"
   },
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
