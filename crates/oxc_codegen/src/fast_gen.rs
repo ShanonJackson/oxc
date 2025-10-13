@@ -1818,7 +1818,7 @@ fn emit_program_impl<'a>(program: &Program<'a>, p: &mut Codegen<'a>, ctx: Contex
 
 #[inline(always)]
 fn emit_hashbang_impl(hashbang: &Hashbang<'_>, p: &mut Codegen<'_>) {
-    p.print_str("#!");
+    p.print_keyword(b"#!");
     p.print_str(hashbang.value.as_str());
     p.print_hard_newline();
 }
@@ -2048,7 +2048,7 @@ fn emit_boolean_literal_impl(lit: &BooleanLiteral, p: &mut Codegen, _ctx: Contex
 fn emit_null_literal_impl(lit: &NullLiteral, p: &mut Codegen, _ctx: Context) {
     p.print_space_before_identifier();
     p.add_source_mapping(lit.span);
-    p.print_str("null");
+    p.print_keyword(b"null");
 }
 
 #[inline(always)]
@@ -2064,7 +2064,7 @@ fn emit_numeric_literal_impl<'a>(
         p.print_str(&lit.raw_str());
     } else if value.is_nan() {
         p.print_space_before_identifier();
-        p.print_str("NaN");
+        p.print_keyword(b"NaN");
     } else if value.is_infinite() {
         let wrap = (p.options.minify && precedence >= Precedence::Multiply)
             || (value.is_sign_negative() && precedence >= Precedence::Prefix);
@@ -2076,16 +2076,16 @@ fn emit_numeric_literal_impl<'a>(
                 p.print_space_before_identifier();
             }
             if p.options.minify {
-                p.print_str("1/0");
+                p.print_keyword(b"1/0");
             } else {
-                p.print_str("Infinity");
+                p.print_keyword(b"Infinity");
             }
         });
     } else if value.is_sign_positive() {
         p.print_space_before_identifier();
         p.print_non_negative_float(value);
     } else if precedence >= Precedence::Prefix {
-        p.print_str("(-");
+        p.print_keyword(b"(-");
         p.print_non_negative_float(value.abs());
         p.print_ascii_byte(b')');
     } else {
@@ -2108,7 +2108,7 @@ fn emit_bigint_literal_impl<'a>(
     if value.starts_with('-') && precedence >= Precedence::Prefix {
         p.print_ascii_byte(b'(');
         p.print_str(value);
-        p.print_str("n)");
+        p.print_keyword(b"n)");
     } else {
         p.print_str(value);
         p.print_ascii_byte(b'n');
@@ -2146,7 +2146,7 @@ fn emit_string_literal_impl<'a>(lit: &StringLiteral<'a>, p: &mut Codegen<'a>, _c
 fn emit_this_expression_impl(expr: &ThisExpression, p: &mut Codegen<'_>, _ctx: Context) {
     p.print_space_before_identifier();
     p.add_source_mapping(expr.span);
-    p.print_str("this");
+    p.print_keyword(b"this");
 }
 
 #[inline(always)]
@@ -2168,7 +2168,7 @@ fn emit_computed_member_expression_impl<'a>(
         expr.object.print_expr(p, Precedence::Postfix, ctx.intersection(Context::FORBID_CALL));
     });
     if expr.optional {
-        p.print_str("?.");
+        p.print_keyword(b"?.");
     }
     p.print_ascii_byte(b'[');
     expr.expression.print_expr(p, Precedence::Lowest, Context::empty());
@@ -2201,7 +2201,7 @@ fn emit_private_field_expression_impl<'a>(
 ) {
     expr.object.print_expr(p, Precedence::Postfix, ctx.intersection(Context::FORBID_CALL));
     if expr.optional {
-        p.print_str("?");
+        p.print_keyword(b"?");
     }
     p.print_ascii_byte(b'.');
     expr.field.print(p, ctx);
@@ -2280,7 +2280,7 @@ fn emit_unary_expression_impl<'a>(
             && !p.options.minify
             && matches!(&expr.argument, Expression::NumericLiteral(lit) if lit.value.is_sign_positive() && lit.value.is_infinite());
         if is_delete_infinity {
-            p.print_str("(0,");
+            p.print_keyword(b"(0,");
             p.print_soft_space();
         }
         expr.argument
@@ -2323,7 +2323,7 @@ fn emit_private_in_expression_impl<'a>(
     p.wrap(precedence >= Precedence::Compare, |p| {
         p.add_source_mapping(expr.span);
         expr.left.print(p, ctx);
-        p.print_str(" in ");
+        p.print_keyword(b" in ");
         expr.right.print_expr(p, Precedence::Equals, Context::FORBID_IN);
     });
 }
@@ -2779,7 +2779,7 @@ fn emit_ts_as_expression_impl<'a>(
     let wrap = precedence >= Precedence::Shift;
     p.wrap(wrap, |p| {
         expr.expression.print_expr(p, Precedence::Exponentiation, ctx);
-        p.print_str(" as ");
+        p.print_keyword(b" as ");
         expr.type_annotation.print(p, ctx);
     });
 }
@@ -2801,7 +2801,7 @@ fn emit_ts_satisfies_expression_impl<'a>(
     p.wrap(should_wrap, |p| {
         expr.expression.print_expr(p, precedence, Context::default());
     });
-    p.print_str(" satisfies ");
+    p.print_keyword(b" satisfies ");
     expr.type_annotation.print(p, ctx);
     p.print_ascii_byte(b')');
 }
@@ -2844,12 +2844,12 @@ fn emit_ts_type_assertion_impl<'a>(
     ctx: Context,
 ) {
     p.wrap(precedence >= expr.precedence(), |p| {
-        p.print_str("<");
+        p.print_keyword(b"<");
         if matches!(expr.type_annotation, TSType::TSFunctionType(_)) {
             p.print_hard_space();
         }
         expr.type_annotation.print(p, ctx);
-        p.print_str(">");
+        p.print_keyword(b">");
         expr.expression.print_expr(p, Precedence::Member, ctx);
     });
 }
@@ -2907,7 +2907,7 @@ fn emit_call_expression_impl<'a>(
         }
         expr.callee.print_expr(p, Precedence::Postfix, Context::empty());
         if expr.optional {
-            p.print_str("?.");
+            p.print_keyword(b"?.");
         }
         if let Some(type_parameters) = &expr.type_arguments {
             type_parameters.print(p, ctx);
@@ -3038,12 +3038,12 @@ fn emit_object_property_impl<'a>(prop: &ObjectProperty<'a>, p: &mut Codegen<'a>,
         let is_accessor = match &prop.kind {
             PropertyKind::Init => false,
             PropertyKind::Get => {
-                p.print_str("get");
+                p.print_keyword(b"get");
                 p.print_soft_space();
                 true
             }
             PropertyKind::Set => {
-                p.print_str("set");
+                p.print_keyword(b"set");
                 p.print_soft_space();
                 true
             }
@@ -3051,11 +3051,11 @@ fn emit_object_property_impl<'a>(prop: &ObjectProperty<'a>, p: &mut Codegen<'a>,
         if prop.method || is_accessor {
             if func.r#async {
                 p.print_space_before_identifier();
-                p.print_str("async");
+                p.print_keyword(b"async");
                 p.print_soft_space();
             }
             if func.generator {
-                p.print_str("*");
+                p.print_keyword(b"*");
             }
             if prop.computed {
                 p.print_ascii_byte(b'[');
@@ -3326,10 +3326,10 @@ fn emit_function_impl<'a>(function: &Function<'a>, p: &mut Codegen<'a>, ctx: Con
         p.print_space_before_identifier();
         p.add_source_mapping(function.span);
         if function.declare {
-            p.print_str("declare ");
+            p.print_keyword(b"declare ");
         }
         if function.r#async {
-            p.print_str("async ");
+            p.print_keyword(b"async ");
         }
         p.print_keyword(b"function");
         if function.generator {
@@ -3347,14 +3347,14 @@ fn emit_function_impl<'a>(function: &Function<'a>, p: &mut Codegen<'a>, ctx: Con
         if let Some(this_param) = &function.this_param {
             this_param.print(p, ctx);
             if !function.params.is_empty() || function.params.rest.is_some() {
-                p.print_str(",");
+                p.print_keyword(b",");
                 p.print_soft_space();
             }
         }
         function.params.print(p, ctx);
         p.print_ascii_byte(b')');
         if let Some(return_type) = &function.return_type {
-            p.print_str(": ");
+            p.print_keyword(b": ");
             return_type.print(p, ctx);
         }
         if let Some(body) = &function.body {
@@ -3400,12 +3400,12 @@ fn emit_formal_parameter_impl<'a>(param: &FormalParameter<'a>, p: &mut Codegen<'
     }
     if param.r#override {
         p.print_space_before_identifier();
-        p.print_str("override");
+        p.print_keyword(b"override");
         p.print_soft_space();
     }
     if param.readonly {
         p.print_space_before_identifier();
-        p.print_str("readonly");
+        p.print_keyword(b"readonly");
         p.print_soft_space();
     }
     param.pattern.print(p, ctx);
@@ -3438,7 +3438,7 @@ fn emit_arrow_function_expression_impl<'a>(
         if expr.r#async {
             p.print_space_before_identifier();
             p.add_source_mapping(expr.span);
-            p.print_str("async");
+            p.print_keyword(b"async");
             p.print_soft_space();
         }
         if let Some(type_parameters) = &expr.type_parameters {
@@ -3461,12 +3461,12 @@ fn emit_arrow_function_expression_impl<'a>(
             expr.params.print(p, ctx);
         });
         if let Some(return_type) = &expr.return_type {
-            p.print_str(":");
+            p.print_keyword(b":");
             p.print_soft_space();
             return_type.print(p, ctx);
         }
         p.print_soft_space();
-        p.print_str("=>");
+        p.print_keyword(b"=>");
         p.print_soft_space();
         if expr.expression {
             if let Some(Statement::ExpressionStatement(stmt)) = expr.body.statements.first() {
@@ -3783,7 +3783,7 @@ fn emit_for_of_statement_impl<'a>(stmt: &ForOfStatement<'a>, p: &mut Codegen<'a>
     p.print_space_before_identifier();
     p.print_keyword(b"for");
     if stmt.r#await {
-        p.print_str(" await");
+        p.print_keyword(b" await");
     }
     p.print_soft_space();
     p.print_ascii_byte(b'(');
@@ -3816,10 +3816,10 @@ fn emit_class_impl<'a>(class: &Class<'a>, p: &mut Codegen<'a>, ctx: Context) {
         p.print_space_before_identifier();
         p.add_source_mapping(class.span);
         if class.declare {
-            p.print_str("declare ");
+            p.print_keyword(b"declare ");
         }
         if class.r#abstract {
-            p.print_str("abstract ");
+            p.print_keyword(b"abstract ");
         }
         p.print_keyword(b"class");
         if let Some(id) = &class.id {
@@ -3830,14 +3830,14 @@ fn emit_class_impl<'a>(class: &Class<'a>, p: &mut Codegen<'a>, ctx: Context) {
             }
         }
         if let Some(super_class) = class.super_class.as_ref() {
-            p.print_str(" extends ");
+            p.print_keyword(b" extends ");
             super_class.print_expr(p, Precedence::Postfix, Context::empty());
             if let Some(super_type_parameters) = &class.super_type_arguments {
                 super_type_parameters.print(p, ctx);
             }
         }
         if !class.implements.is_empty() {
-            p.print_str(" implements ");
+            p.print_keyword(b" implements ");
             p.print_list(&class.implements, ctx);
         }
         p.print_soft_space();
@@ -3888,7 +3888,7 @@ fn emit_class_element_impl<'a>(elem: &ClassElement<'a>, p: &mut Codegen<'a>, ctx
 #[inline(always)]
 fn emit_static_block_impl<'a>(block: &StaticBlock<'a>, p: &mut Codegen<'a>, ctx: Context) {
     p.add_source_mapping(block.span);
-    p.print_str("static");
+    p.print_keyword(b"static");
     p.print_soft_space();
     p.print_curly_braces(block.span, block.body.is_empty(), |p| {
         for stmt in &block.body {
@@ -3907,7 +3907,7 @@ fn emit_template_literal_impl<'a>(template: &TemplateLiteral<'a>, p: &mut Codege
     let (first_quasi, remaining_quasis) = template.quasis.split_first().unwrap();
     p.print_str_escaping_script_close_tag(first_quasi.value.raw.as_str());
     for (expr, quasi) in template.expressions.iter().zip(remaining_quasis) {
-        p.print_str("${");
+        p.print_keyword(b"${");
         p.print_expression(expr);
         p.print_ascii_byte(b'}');
         p.add_source_mapping(quasi.span);
@@ -3945,34 +3945,34 @@ fn emit_method_definition_impl<'a>(
     }
     if method.r#type == MethodDefinitionType::TSAbstractMethodDefinition {
         p.print_space_before_identifier();
-        p.print_str("abstract");
+        p.print_keyword(b"abstract");
         p.print_soft_space();
     }
     if method.r#static {
         p.print_space_before_identifier();
-        p.print_str("static");
+        p.print_keyword(b"static");
         p.print_soft_space();
     }
     match &method.kind {
         MethodDefinitionKind::Constructor | MethodDefinitionKind::Method => {}
         MethodDefinitionKind::Get => {
             p.print_space_before_identifier();
-            p.print_str("get");
+            p.print_keyword(b"get");
             p.print_soft_space();
         }
         MethodDefinitionKind::Set => {
             p.print_space_before_identifier();
-            p.print_str("set");
+            p.print_keyword(b"set");
             p.print_soft_space();
         }
     }
     if method.value.r#async {
         p.print_space_before_identifier();
-        p.print_str("async");
+        p.print_keyword(b"async");
         p.print_soft_space();
     }
     if method.value.generator {
-        p.print_str("*");
+        p.print_keyword(b"*");
     }
     if method.computed {
         p.print_ascii_byte(b'[');
@@ -3991,7 +3991,7 @@ fn emit_method_definition_impl<'a>(
     if let Some(this_param) = &method.value.this_param {
         this_param.print(p, ctx);
         if !method.value.params.is_empty() || method.value.params.rest.is_some() {
-            p.print_str(",");
+            p.print_keyword(b",");
             p.print_soft_space();
         }
     }
@@ -4020,7 +4020,7 @@ fn emit_property_definition_impl<'a>(
     p.print_decorators(&property.decorators, ctx);
     if property.declare {
         p.print_space_before_identifier();
-        p.print_str("declare");
+        p.print_keyword(b"declare");
         p.print_soft_space();
     }
     if let Some(accessibility) = property.accessibility {
@@ -4030,17 +4030,17 @@ fn emit_property_definition_impl<'a>(
     }
     if property.r#type == PropertyDefinitionType::TSAbstractPropertyDefinition {
         p.print_space_before_identifier();
-        p.print_str("abstract");
+        p.print_keyword(b"abstract");
         p.print_soft_space();
     }
     if property.r#static {
         p.print_space_before_identifier();
-        p.print_str("static");
+        p.print_keyword(b"static");
         p.print_soft_space();
     }
     if property.readonly {
         p.print_space_before_identifier();
-        p.print_str("readonly");
+        p.print_keyword(b"readonly");
         p.print_soft_space();
     }
     if property.computed {
@@ -4051,7 +4051,7 @@ fn emit_property_definition_impl<'a>(
         p.print_ascii_byte(b']');
     }
     if property.optional {
-        p.print_str("?");
+        p.print_keyword(b"?");
     }
     if let Some(type_annotation) = &property.type_annotation {
         p.print_colon();
@@ -4076,7 +4076,7 @@ fn emit_accessor_property_impl<'a>(
     p.print_decorators(&property.decorators, ctx);
     if property.r#type.is_abstract() {
         p.print_space_before_identifier();
-        p.print_str("abstract");
+        p.print_keyword(b"abstract");
         p.print_soft_space();
     }
     if let Some(accessibility) = property.accessibility {
@@ -4086,16 +4086,16 @@ fn emit_accessor_property_impl<'a>(
     }
     if property.r#static {
         p.print_space_before_identifier();
-        p.print_str("static");
+        p.print_keyword(b"static");
         p.print_soft_space();
     }
     if property.r#override {
         p.print_space_before_identifier();
-        p.print_str("override");
+        p.print_keyword(b"override");
         p.print_soft_space();
     }
     p.print_space_before_identifier();
-    p.print_str("accessor");
+    p.print_keyword(b"accessor");
     if property.computed {
         p.print_soft_space();
         p.print_ascii_byte(b'[');
@@ -4139,7 +4139,7 @@ fn emit_private_identifier_impl<'a>(ident: &PrivateIdentifier<'a>, p: &mut Codeg
 fn emit_binding_pattern_impl<'a>(pattern: &BindingPattern<'a>, p: &mut Codegen<'a>, ctx: Context) {
     emit_binding_pattern_kind_impl(&pattern.kind, p, ctx);
     if pattern.optional {
-        p.print_str("?");
+        p.print_keyword(b"?");
     }
     if let Some(type_annotation) = &pattern.type_annotation {
         p.print_colon();
@@ -4387,7 +4387,7 @@ fn emit_jsx_spread_attribute_impl<'a>(
     ctx: Context,
 ) {
     let _ = ctx;
-    p.print_str("{...");
+    p.print_keyword(b"{...");
     attr.argument.print_expr(p, Precedence::Comma, Context::empty());
     p.print_ascii_byte(b'}');
 }
@@ -4424,7 +4424,7 @@ fn emit_jsx_element_impl<'a>(element: &JSXElement<'a>, p: &mut Codegen<'a>, ctx:
     }
     if element.closing_element.is_none() {
         p.print_soft_space();
-        p.print_str("/");
+        p.print_keyword(b"/");
     }
     p.print_ascii_byte(b'>');
 
@@ -4434,7 +4434,7 @@ fn emit_jsx_element_impl<'a>(element: &JSXElement<'a>, p: &mut Codegen<'a>, ctx:
 
     if let Some(closing_element) = &element.closing_element {
         p.add_source_mapping(closing_element.span);
-        p.print_str("</");
+        p.print_keyword(b"</");
         emit_jsx_element_name_impl(&closing_element.name, p, ctx);
         p.print_ascii_byte(b'>');
     }
@@ -4447,7 +4447,7 @@ fn emit_jsx_opening_fragment_impl(
     _ctx: Context,
 ) {
     p.add_source_mapping(fragment.span);
-    p.print_str("<>");
+    p.print_keyword(b"<>");
 }
 
 #[inline(always)]
@@ -4457,7 +4457,7 @@ fn emit_jsx_closing_fragment_impl(
     _ctx: Context,
 ) {
     p.add_source_mapping(fragment.span);
-    p.print_str("</>");
+    p.print_keyword(b"</>");
 }
 
 #[inline(always)]
@@ -4468,7 +4468,7 @@ fn emit_jsx_text_impl(text: &JSXText<'_>, p: &mut Codegen<'_>, _ctx: Context) {
 
 #[inline(always)]
 fn emit_jsx_spread_child_impl(child: &JSXSpreadChild<'_>, p: &mut Codegen<'_>, _ctx: Context) {
-    p.print_str("{...");
+    p.print_keyword(b"{...");
     p.print_expression(&child.expression);
     p.print_ascii_byte(b'}');
 }
@@ -4605,7 +4605,7 @@ fn emit_variable_declaration_inner<'a>(
 ) {
     p.print_space_before_identifier();
     if decl.declare {
-        p.print_str("declare ");
+        p.print_keyword(b"declare ");
     }
 
     match decl.kind {
@@ -4636,7 +4636,7 @@ fn emit_variable_declarator_impl<'a>(
         p.print_ascii_byte(b'!');
     }
     if decl.id.optional {
-        p.print_str("?");
+        p.print_keyword(b"?");
     }
     if let Some(type_annotation) = &decl.id.type_annotation {
         p.print_colon();
@@ -4663,7 +4663,7 @@ fn emit_import_declaration_impl<'a>(
     p.print_space_before_identifier();
     p.print_keyword(b"import");
     if decl.import_kind.is_type() {
-        p.print_str(" type");
+        p.print_keyword(b" type");
     }
     if let Some(phase) = decl.phase {
         p.print_hard_space();
@@ -4672,7 +4672,7 @@ fn emit_import_declaration_impl<'a>(
     if let Some(specifiers) = &decl.specifiers {
         if specifiers.is_empty() {
             p.print_soft_space();
-            p.print_str("{}");
+            p.print_keyword(b"{}");
             p.print_soft_space();
             p.print_keyword(b"from");
             p.print_soft_space();
@@ -4693,7 +4693,7 @@ fn emit_import_declaration_impl<'a>(
                 ImportDeclarationSpecifier::ImportDefaultSpecifier(spec) => {
                     if in_block {
                         p.print_soft_space();
-                        p.print_str("},");
+                        p.print_keyword(b"},");
                         in_block = false;
                     } else if index == 0 {
                         p.print_hard_space();
@@ -4709,7 +4709,7 @@ fn emit_import_declaration_impl<'a>(
                 ImportDeclarationSpecifier::ImportNamespaceSpecifier(spec) => {
                     if in_block {
                         p.print_soft_space();
-                        p.print_str("},");
+                        p.print_keyword(b"},");
                         in_block = false;
                     } else if index == 0 {
                         p.print_soft_space();
@@ -4719,7 +4719,7 @@ fn emit_import_declaration_impl<'a>(
                     }
                     p.print_ascii_byte(b'*');
                     p.print_soft_space();
-                    p.print_str("as ");
+                    p.print_keyword(b"as ");
                     spec.local.print(p, ctx);
                     p.print_hard_space();
                 }
@@ -4738,14 +4738,14 @@ fn emit_import_declaration_impl<'a>(
                     }
 
                     if spec.import_kind.is_type() {
-                        p.print_str("type ");
+                        p.print_keyword(b"type ");
                     }
 
                     spec.imported.print(p, ctx);
                     let local_name = p.get_binding_identifier_name(&spec.local);
                     let imported_name = get_module_export_name(&spec.imported, p);
                     if imported_name != local_name {
-                        p.print_str(" as ");
+                        p.print_keyword(b" as ");
                         spec.local.print(p, ctx);
                     }
                 }
@@ -4846,7 +4846,7 @@ fn emit_export_named_declaration_impl<'a>(
     } else {
         if decl.export_kind.is_type() {
             p.print_hard_space();
-            p.print_str("type");
+            p.print_keyword(b"type");
         }
         p.print_soft_space();
         p.print_ascii_byte(b'{');
@@ -4874,7 +4874,7 @@ fn emit_ts_export_assignment_impl<'a>(
 ) {
     p.print_indent();
     p.print_comments_at(decl.span.start);
-    p.print_str("export = ");
+    p.print_keyword(b"export = ");
     decl.expression.print_expr(p, Precedence::Lowest, ctx);
     p.print_semicolon_after_statement();
 }
@@ -4887,7 +4887,7 @@ fn emit_ts_namespace_export_declaration_impl<'a>(
 ) {
     p.print_indent();
     p.print_comments_at(decl.span.start);
-    p.print_str("export as namespace ");
+    p.print_keyword(b"export as namespace ");
     decl.id.print(p, ctx);
     p.print_semicolon_after_statement();
 }
@@ -4895,13 +4895,13 @@ fn emit_ts_namespace_export_declaration_impl<'a>(
 #[inline(always)]
 fn emit_export_specifier_impl<'a>(spec: &ExportSpecifier<'a>, p: &mut Codegen<'a>, ctx: Context) {
     if spec.export_kind.is_type() {
-        p.print_str("type ");
+        p.print_keyword(b"type ");
     }
     spec.local.print(p, ctx);
     let local_name = get_module_export_name(&spec.local, p);
     let exported_name = get_module_export_name(&spec.exported, p);
     if local_name != exported_name {
-        p.print_str(" as ");
+        p.print_keyword(b" as ");
         spec.exported.print(p, ctx);
     }
 }
@@ -4942,7 +4942,7 @@ fn emit_export_all_declaration_impl<'a>(
     p.print_indent();
     p.print_keyword(b"export");
     if decl.export_kind.is_type() {
-        p.print_str(" type ");
+        p.print_keyword(b" type ");
     } else {
         p.print_soft_space();
     }
@@ -4950,7 +4950,7 @@ fn emit_export_all_declaration_impl<'a>(
 
     if let Some(exported) = &decl.exported {
         p.print_soft_space();
-        p.print_str("as ");
+        p.print_keyword(b"as ");
         exported.print(p, ctx);
         p.print_hard_space();
     } else {
@@ -4982,7 +4982,7 @@ fn emit_export_default_declaration_impl<'a>(
     }
     p.add_source_mapping(decl.span);
     p.print_indent();
-    p.print_str("export default ");
+    p.print_keyword(b"export default ");
     decl.declaration.print(p, ctx);
 }
 
@@ -5016,9 +5016,9 @@ fn emit_ts_import_equals_declaration_impl<'a>(
     p: &mut Codegen<'a>,
     ctx: Context,
 ) {
-    p.print_str("import ");
+    p.print_keyword(b"import ");
     decl.id.print(p, ctx);
-    p.print_str(" = ");
+    p.print_keyword(b" = ");
     decl.module_reference.print(p, ctx);
 }
 
@@ -5030,9 +5030,9 @@ fn emit_ts_import_equals_module_reference_impl<'a>(
 ) {
     match reference {
         TSModuleReference::ExternalModuleReference(decl) => {
-            p.print_str("require(");
+            p.print_keyword(b"require(");
             p.print_string_literal(&decl.expression, false);
-            p.print_str(")");
+            p.print_keyword(b")");
         }
         match_ts_type_name!(TSModuleReference) => reference.to_ts_type_name().print(p, ctx),
     }
@@ -5098,7 +5098,7 @@ fn emit_ts_type_parameter_declaration_impl<'a>(
         p.dedent();
         p.print_indent();
     } else if p.is_jsx {
-        p.print_str(",");
+        p.print_keyword(b",");
     }
     p.print_ascii_byte(b'>');
 }
@@ -5130,20 +5130,20 @@ fn emit_ts_type_impl<'a>(ty: &TSType<'a>, p: &mut Codegen<'a>, ctx: Context) {
         TSType::TSNamedTupleMember(ty) => emit_ts_named_tuple_member_impl(ty, p, ctx),
         TSType::TSLiteralType(ty) => ty.literal.print(p, ctx),
         TSType::TSImportType(ty) => emit_ts_import_type_impl(ty, p, ctx),
-        TSType::TSAnyKeyword(_) => p.print_str("any"),
-        TSType::TSBigIntKeyword(_) => p.print_str("bigint"),
-        TSType::TSBooleanKeyword(_) => p.print_str("boolean"),
-        TSType::TSIntrinsicKeyword(_) => p.print_str("intrinsic"),
-        TSType::TSNeverKeyword(_) => p.print_str("never"),
-        TSType::TSNullKeyword(_) => p.print_str("null"),
-        TSType::TSNumberKeyword(_) => p.print_str("number"),
-        TSType::TSObjectKeyword(_) => p.print_str("object"),
-        TSType::TSStringKeyword(_) => p.print_str("string"),
-        TSType::TSSymbolKeyword(_) => p.print_str("symbol"),
-        TSType::TSThisType(_) => p.print_str("this"),
-        TSType::TSUndefinedKeyword(_) => p.print_str("undefined"),
-        TSType::TSUnknownKeyword(_) | TSType::JSDocUnknownType(_) => p.print_str("unknown"),
-        TSType::TSVoidKeyword(_) => p.print_str("void"),
+        TSType::TSAnyKeyword(_) => p.print_keyword(b"any"),
+        TSType::TSBigIntKeyword(_) => p.print_keyword(b"bigint"),
+        TSType::TSBooleanKeyword(_) => p.print_keyword(b"boolean"),
+        TSType::TSIntrinsicKeyword(_) => p.print_keyword(b"intrinsic"),
+        TSType::TSNeverKeyword(_) => p.print_keyword(b"never"),
+        TSType::TSNullKeyword(_) => p.print_keyword(b"null"),
+        TSType::TSNumberKeyword(_) => p.print_keyword(b"number"),
+        TSType::TSObjectKeyword(_) => p.print_keyword(b"object"),
+        TSType::TSStringKeyword(_) => p.print_keyword(b"string"),
+        TSType::TSSymbolKeyword(_) => p.print_keyword(b"symbol"),
+        TSType::TSThisType(_) => p.print_keyword(b"this"),
+        TSType::TSUndefinedKeyword(_) => p.print_keyword(b"undefined"),
+        TSType::TSUnknownKeyword(_) | TSType::JSDocUnknownType(_) => p.print_keyword(b"unknown"),
+        TSType::TSVoidKeyword(_) => p.print_keyword(b"void"),
         TSType::TSTemplateLiteralType(ty) => emit_ts_template_literal_type_impl(ty, p, ctx),
         TSType::TSTypeLiteral(ty) => emit_ts_type_literal_impl(ty, p, ctx),
         TSType::TSTypeOperatorType(ty) => emit_ts_type_operator_impl(ty, p, ctx),
@@ -5158,14 +5158,14 @@ fn emit_ts_type_impl<'a>(ty: &TSType<'a>, p: &mut Codegen<'a>, ctx: Context) {
 #[inline(always)]
 fn emit_ts_array_type_impl<'a>(ty: &TSArrayType<'a>, p: &mut Codegen<'a>, ctx: Context) {
     ty.element_type.print(p, ctx);
-    p.print_str("[]");
+    p.print_keyword(b"[]");
 }
 
 #[inline(always)]
 fn emit_ts_tuple_type_impl<'a>(ty: &TSTupleType<'a>, p: &mut Codegen<'a>, ctx: Context) {
-    p.print_str("[");
+    p.print_keyword(b"[");
     p.print_list(&ty.element_types, ctx);
-    p.print_str("]");
+    p.print_keyword(b"]");
 }
 
 #[inline(always)]
@@ -5186,7 +5186,7 @@ fn emit_ts_union_type_impl<'a>(ty: &TSUnionType<'a>, p: &mut Codegen<'a>, ctx: C
     });
     for item in rest {
         p.print_soft_space();
-        p.print_str("|");
+        p.print_keyword(b"|");
         p.print_soft_space();
         p.wrap(parenthesize_check_type_of_conditional_type(item), |p| {
             item.print(p, ctx);
@@ -5217,7 +5217,7 @@ fn emit_ts_intersection_type_impl<'a>(
     first.print(p, ctx);
     for item in rest {
         p.print_soft_space();
-        p.print_str("&");
+        p.print_keyword(b"&");
         p.print_soft_space();
         item.print(p, ctx);
     }
@@ -5230,17 +5230,17 @@ fn emit_ts_conditional_type_impl<'a>(
     ctx: Context,
 ) {
     ty.check_type.print(p, ctx);
-    p.print_str(" extends ");
+    p.print_keyword(b" extends ");
     ty.extends_type.print(p, ctx);
-    p.print_str(" ? ");
+    p.print_keyword(b" ? ");
     ty.true_type.print(p, ctx);
-    p.print_str(" : ");
+    p.print_keyword(b" : ");
     ty.false_type.print(p, ctx);
 }
 
 #[inline(always)]
 fn emit_ts_infer_type_impl<'a>(ty: &TSInferType<'a>, p: &mut Codegen<'a>, ctx: Context) {
-    p.print_str("infer ");
+    p.print_keyword(b"infer ");
     ty.type_parameter.print(p, ctx);
 }
 
@@ -5251,56 +5251,56 @@ fn emit_ts_indexed_access_type_impl<'a>(
     ctx: Context,
 ) {
     ty.object_type.print(p, ctx);
-    p.print_str("[");
+    p.print_keyword(b"[");
     ty.index_type.print(p, ctx);
-    p.print_str("]");
+    p.print_keyword(b"]");
 }
 
 #[inline(always)]
 fn emit_ts_mapped_type_impl<'a>(ty: &TSMappedType<'a>, p: &mut Codegen<'a>, ctx: Context) {
-    p.print_str("{");
+    p.print_keyword(b"{");
     p.print_soft_space();
     match ty.readonly {
-        Some(TSMappedTypeModifierOperator::True) => p.print_str("readonly "),
-        Some(TSMappedTypeModifierOperator::Plus) => p.print_str("+readonly "),
-        Some(TSMappedTypeModifierOperator::Minus) => p.print_str("-readonly "),
+        Some(TSMappedTypeModifierOperator::True) => p.print_keyword(b"readonly "),
+        Some(TSMappedTypeModifierOperator::Plus) => p.print_keyword(b"+readonly "),
+        Some(TSMappedTypeModifierOperator::Minus) => p.print_keyword(b"-readonly "),
         None => {}
     }
-    p.print_str("[");
+    p.print_keyword(b"[");
     ty.type_parameter.name.print(p, ctx);
     if let Some(constraint) = &ty.type_parameter.constraint {
-        p.print_str(" in ");
+        p.print_keyword(b" in ");
         constraint.print(p, ctx);
     }
     if let Some(default) = &ty.type_parameter.default {
-        p.print_str(" = ");
+        p.print_keyword(b" = ");
         default.print(p, ctx);
     }
     if let Some(name_type) = &ty.name_type {
-        p.print_str(" as ");
+        p.print_keyword(b" as ");
         name_type.print(p, ctx);
     }
-    p.print_str("]");
+    p.print_keyword(b"]");
     match ty.optional {
-        Some(TSMappedTypeModifierOperator::True) => p.print_str("?"),
-        Some(TSMappedTypeModifierOperator::Plus) => p.print_str("+?"),
-        Some(TSMappedTypeModifierOperator::Minus) => p.print_str("-?"),
+        Some(TSMappedTypeModifierOperator::True) => p.print_keyword(b"?"),
+        Some(TSMappedTypeModifierOperator::Plus) => p.print_keyword(b"+?"),
+        Some(TSMappedTypeModifierOperator::Minus) => p.print_keyword(b"-?"),
         None => {}
     }
     p.print_soft_space();
     if let Some(type_annotation) = &ty.type_annotation {
-        p.print_str(":");
+        p.print_keyword(b":");
         p.print_soft_space();
         type_annotation.print(p, ctx);
     }
     p.print_soft_space();
-    p.print_str("}");
+    p.print_keyword(b"}");
 }
 
 #[inline(always)]
 fn emit_ts_qualified_name_impl<'a>(name: &TSQualifiedName<'a>, p: &mut Codegen<'a>, ctx: Context) {
     name.left.print(p, ctx);
-    p.print_str(".");
+    p.print_keyword(b".");
     name.right.print(p, ctx);
 }
 
@@ -5314,14 +5314,14 @@ fn emit_ts_type_operator_impl<'a>(ty: &TSTypeOperator<'a>, p: &mut Codegen<'a>, 
 #[inline(always)]
 fn emit_ts_type_predicate_impl<'a>(ty: &TSTypePredicate<'a>, p: &mut Codegen<'a>, ctx: Context) {
     if ty.asserts {
-        p.print_str("asserts ");
+        p.print_keyword(b"asserts ");
     }
     match &ty.parameter_name {
         TSTypePredicateName::Identifier(ident) => ident.print(p, ctx),
-        TSTypePredicateName::This(_) => p.print_str("this"),
+        TSTypePredicateName::This(_) => p.print_keyword(b"this"),
     }
     if let Some(type_annotation) = &ty.type_annotation {
-        p.print_str(" is ");
+        p.print_keyword(b" is ");
         type_annotation.print(p, ctx);
     }
 }
@@ -5353,7 +5353,7 @@ fn emit_ts_type_name_impl<'a>(ty: &TSTypeName<'a>, p: &mut Codegen<'a>, ctx: Con
         TSTypeName::IdentifierReference(ident) => ident.print(p, ctx),
         TSTypeName::QualifiedName(name) => {
             name.left.print(p, ctx);
-            p.print_str(".");
+            p.print_keyword(b".");
             name.right.print(p, ctx);
         }
         TSTypeName::ThisExpression(expr) => expr.print(p, ctx),
@@ -5368,9 +5368,9 @@ fn emit_jsdoc_nullable_type_impl<'a>(
 ) {
     if ty.postfix {
         ty.type_annotation.print(p, ctx);
-        p.print_str("?");
+        p.print_keyword(b"?");
     } else {
-        p.print_str("?");
+        p.print_keyword(b"?");
         ty.type_annotation.print(p, ctx);
     }
 }
@@ -5383,9 +5383,9 @@ fn emit_jsdoc_non_nullable_type_impl<'a>(
 ) {
     if ty.postfix {
         ty.type_annotation.print(p, ctx);
-        p.print_str("!");
+        p.print_keyword(b"!");
     } else {
-        p.print_str("!");
+        p.print_keyword(b"!");
         ty.type_annotation.print(p, ctx);
     }
 }
@@ -5396,18 +5396,18 @@ fn emit_ts_template_literal_type_impl<'a>(
     p: &mut Codegen<'a>,
     ctx: Context,
 ) {
-    p.print_str("`");
+    p.print_keyword(b"`");
     for (index, item) in ty.quasis.iter().enumerate() {
         if index != 0
             && let Some(types) = ty.types.get(index - 1)
         {
-            p.print_str("${");
+            p.print_keyword(b"${");
             types.print(p, ctx);
-            p.print_str("}");
+            p.print_keyword(b"}");
         }
         p.print_str(item.value.raw.as_str());
     }
-    p.print_str("`");
+    p.print_keyword(b"`");
 }
 
 #[inline(always)]
@@ -5421,16 +5421,16 @@ fn emit_ts_signature_impl<'a>(signature: &TSSignature<'a>, p: &mut Codegen<'a>, 
             if let Some(type_parameters) = signature.type_parameters.as_ref() {
                 type_parameters.print(p, ctx);
             }
-            p.print_str("(");
+            p.print_keyword(b"(");
             if let Some(this_param) = &signature.this_param {
                 emit_ts_this_parameter_impl(this_param, p, ctx);
                 if !signature.params.is_empty() || signature.params.rest.is_some() {
-                    p.print_str(",");
+                    p.print_keyword(b",");
                     p.print_soft_space();
                 }
             }
             signature.params.print(p, ctx);
-            p.print_str(")");
+            p.print_keyword(b")");
             if let Some(return_type) = &signature.return_type {
                 p.print_colon();
                 p.print_soft_space();
@@ -5438,13 +5438,13 @@ fn emit_ts_signature_impl<'a>(signature: &TSSignature<'a>, p: &mut Codegen<'a>, 
             }
         }
         TSSignature::TSConstructSignatureDeclaration(signature) => {
-            p.print_str("new ");
+            p.print_keyword(b"new ");
             if let Some(type_parameters) = signature.type_parameters.as_ref() {
                 type_parameters.print(p, ctx);
             }
-            p.print_str("(");
+            p.print_keyword(b"(");
             signature.params.print(p, ctx);
-            p.print_str(")");
+            p.print_keyword(b")");
             if let Some(return_type) = &signature.return_type {
                 p.print_colon();
                 p.print_soft_space();
@@ -5454,8 +5454,8 @@ fn emit_ts_signature_impl<'a>(signature: &TSSignature<'a>, p: &mut Codegen<'a>, 
         TSSignature::TSMethodSignature(signature) => {
             match signature.kind {
                 TSMethodSignatureKind::Method => {}
-                TSMethodSignatureKind::Get => p.print_str("get "),
-                TSMethodSignatureKind::Set => p.print_str("set "),
+                TSMethodSignatureKind::Get => p.print_keyword(b"get "),
+                TSMethodSignatureKind::Set => p.print_keyword(b"set "),
             }
             if signature.computed {
                 p.print_ascii_byte(b'[');
@@ -5470,21 +5470,21 @@ fn emit_ts_signature_impl<'a>(signature: &TSSignature<'a>, p: &mut Codegen<'a>, 
                 }
             }
             if signature.optional {
-                p.print_str("?");
+                p.print_keyword(b"?");
             }
             if let Some(type_parameters) = &signature.type_parameters {
                 type_parameters.print(p, ctx);
             }
-            p.print_str("(");
+            p.print_keyword(b"(");
             if let Some(this_param) = &signature.this_param {
                 emit_ts_this_parameter_impl(this_param, p, ctx);
                 if !signature.params.is_empty() || signature.params.rest.is_some() {
-                    p.print_str(",");
+                    p.print_keyword(b",");
                     p.print_soft_space();
                 }
             }
             signature.params.print(p, ctx);
-            p.print_str(")");
+            p.print_keyword(b")");
             if let Some(return_type) = &signature.return_type {
                 p.print_colon();
                 p.print_soft_space();
@@ -5509,21 +5509,21 @@ fn emit_ts_literal_impl<'a>(literal: &TSLiteral<'a>, p: &mut Codegen<'a>, ctx: C
 #[inline(always)]
 fn emit_ts_type_parameter_impl<'a>(param: &TSTypeParameter<'a>, p: &mut Codegen<'a>, ctx: Context) {
     if param.r#const {
-        p.print_str("const ");
+        p.print_keyword(b"const ");
     }
     if param.r#in {
-        p.print_str("in ");
+        p.print_keyword(b"in ");
     }
     if param.out {
-        p.print_str("out ");
+        p.print_keyword(b"out ");
     }
     param.name.print(p, ctx);
     if let Some(constraint) = &param.constraint {
-        p.print_str(" extends ");
+        p.print_keyword(b" extends ");
         constraint.print(p, ctx);
     }
     if let Some(default) = &param.default {
-        p.print_str(" = ");
+        p.print_keyword(b" = ");
         default.print(p, ctx);
     }
 }
@@ -5535,7 +5535,7 @@ fn emit_ts_property_signature_impl<'a>(
     ctx: Context,
 ) {
     if signature.readonly {
-        p.print_str("readonly ");
+        p.print_keyword(b"readonly ");
     }
     if signature.computed {
         p.print_ascii_byte(b'[');
@@ -5550,7 +5550,7 @@ fn emit_ts_property_signature_impl<'a>(
         }
     }
     if signature.optional {
-        p.print_str("?");
+        p.print_keyword(b"?");
     }
     if let Some(type_annotation) = &signature.type_annotation {
         p.print_colon();
@@ -5561,7 +5561,7 @@ fn emit_ts_property_signature_impl<'a>(
 
 #[inline(always)]
 fn emit_ts_type_query_impl<'a>(query: &TSTypeQuery<'a>, p: &mut Codegen<'a>, ctx: Context) {
-    p.print_str("typeof ");
+    p.print_keyword(b"typeof ");
     query.expr_name.print(p, ctx);
     if let Some(type_params) = &query.type_arguments {
         type_params.print(p, ctx);
@@ -5582,13 +5582,13 @@ fn emit_ts_type_query_expr_name_impl<'a>(
 
 #[inline(always)]
 fn emit_ts_import_type_impl<'a>(import: &TSImportType<'a>, p: &mut Codegen<'a>, ctx: Context) {
-    p.print_str("import(");
+    p.print_keyword(b"import(");
     import.argument.print(p, ctx);
     if let Some(options) = &import.options {
-        p.print_str(", ");
+        p.print_keyword(b", ");
         options.print_expr(p, Precedence::Lowest, ctx);
     }
-    p.print_str(")");
+    p.print_keyword(b")");
     if let Some(qualifier) = &import.qualifier {
         p.print_ascii_byte(b'.');
         emit_ts_import_type_qualifier_impl(qualifier, p, ctx);
@@ -5629,9 +5629,9 @@ fn emit_ts_type_parameter_instantiation_impl<'a>(
     p: &mut Codegen<'a>,
     ctx: Context,
 ) {
-    p.print_str("<");
+    p.print_keyword(b"<");
     p.print_list(&instantiation.params, ctx);
-    p.print_str(">");
+    p.print_keyword(b">");
 }
 
 #[inline(always)]
@@ -5641,12 +5641,12 @@ fn emit_ts_index_signature_impl<'a>(
     ctx: Context,
 ) {
     if signature.readonly {
-        p.print_str("readonly ");
+        p.print_keyword(b"readonly ");
     }
-    p.print_str("[");
+    p.print_keyword(b"[");
     for (index, parameter) in signature.parameters.iter().enumerate() {
         if index != 0 {
-            p.print_str(",");
+            p.print_keyword(b",");
             p.print_soft_space();
         }
         p.print_str(parameter.name.as_str());
@@ -5654,7 +5654,7 @@ fn emit_ts_index_signature_impl<'a>(
         p.print_soft_space();
         parameter.type_annotation.print(p, ctx);
     }
-    p.print_str("]");
+    p.print_keyword(b"]");
     p.print_colon();
     p.print_soft_space();
     signature.type_annotation.print(p, ctx);
@@ -5666,10 +5666,10 @@ fn emit_ts_tuple_element_impl<'a>(element: &TSTupleElement<'a>, p: &mut Codegen<
         match_ts_type!(TSTupleElement) => element.to_ts_type().print(p, ctx),
         TSTupleElement::TSOptionalType(ts_type) => {
             ts_type.type_annotation.print(p, ctx);
-            p.print_str("?");
+            p.print_keyword(b"?");
         }
         TSTupleElement::TSRestType(ts_type) => {
-            p.print_str("...");
+            p.print_keyword(b"...");
             ts_type.type_annotation.print(p, ctx);
         }
     }
@@ -5683,9 +5683,9 @@ fn emit_ts_named_tuple_member_impl<'a>(
 ) {
     member.label.print(p, ctx);
     if member.optional {
-        p.print_str("?");
+        p.print_keyword(b"?");
     }
-    p.print_str(":");
+    p.print_keyword(b":");
     p.print_soft_space();
     member.element_type.print(p, ctx);
 }
@@ -5695,27 +5695,27 @@ fn emit_ts_function_type_impl<'a>(ty: &TSFunctionType<'a>, p: &mut Codegen<'a>, 
     if let Some(type_parameters) = &ty.type_parameters {
         type_parameters.print(p, ctx);
     }
-    p.print_str("(");
+    p.print_keyword(b"(");
     if let Some(this_param) = &ty.this_param {
         emit_ts_this_parameter_impl(this_param, p, ctx);
         if !ty.params.is_empty() || ty.params.rest.is_some() {
-            p.print_str(",");
+            p.print_keyword(b",");
             p.print_soft_space();
         }
     }
     ty.params.print(p, ctx);
-    p.print_str(")");
+    p.print_keyword(b")");
     p.print_soft_space();
-    p.print_str("=>");
+    p.print_keyword(b"=>");
     p.print_soft_space();
     ty.return_type.print(p, ctx);
 }
 
 #[inline(always)]
 fn emit_ts_this_parameter_impl<'a>(param: &TSThisParameter<'a>, p: &mut Codegen<'a>, ctx: Context) {
-    p.print_str("this");
+    p.print_keyword(b"this");
     if let Some(type_annotation) = &param.type_annotation {
-        p.print_str(": ");
+        p.print_keyword(b": ");
         type_annotation.print(p, ctx);
     }
 }
@@ -5727,17 +5727,17 @@ fn emit_ts_constructor_type_impl<'a>(
     ctx: Context,
 ) {
     if ty.r#abstract {
-        p.print_str("abstract ");
+        p.print_keyword(b"abstract ");
     }
-    p.print_str("new ");
+    p.print_keyword(b"new ");
     if let Some(type_parameters) = &ty.type_parameters {
         type_parameters.print(p, ctx);
     }
-    p.print_str("(");
+    p.print_keyword(b"(");
     ty.params.print(p, ctx);
-    p.print_str(")");
+    p.print_keyword(b")");
     p.print_soft_space();
-    p.print_str("=>");
+    p.print_keyword(b"=>");
     p.print_soft_space();
     ty.return_type.print(p, ctx);
 }
@@ -5749,7 +5749,7 @@ fn emit_ts_module_declaration_impl<'a>(
     ctx: Context,
 ) {
     if decl.declare {
-        p.print_str("declare ");
+        p.print_keyword(b"declare ");
     }
     p.print_str(decl.kind.as_str());
     if !decl.kind.is_global() {
@@ -5811,16 +5811,16 @@ fn emit_ts_type_alias_declaration_impl<'a>(
     ctx: Context,
 ) {
     if decl.declare {
-        p.print_str("declare ");
+        p.print_keyword(b"declare ");
     }
-    p.print_str("type");
+    p.print_keyword(b"type");
     p.print_space_before_identifier();
     decl.id.print(p, ctx);
     if let Some(params) = &decl.type_parameters {
         params.print(p, ctx);
     }
     p.print_soft_space();
-    p.print_str("=");
+    p.print_keyword(b"=");
     p.print_soft_space();
     decl.type_annotation.print(p, ctx);
 }
@@ -5831,14 +5831,14 @@ fn emit_ts_interface_declaration_impl<'a>(
     p: &mut Codegen<'a>,
     ctx: Context,
 ) {
-    p.print_str("interface");
+    p.print_keyword(b"interface");
     p.print_hard_space();
     decl.id.print(p, ctx);
     if let Some(params) = &decl.type_parameters {
         params.print(p, ctx);
     }
     if !decl.extends.is_empty() {
-        p.print_str(" extends ");
+        p.print_keyword(b" extends ");
         p.print_list(&decl.extends, ctx);
     }
     p.print_soft_space();
@@ -5873,13 +5873,13 @@ fn emit_ts_enum_declaration_impl<'a>(
 ) {
     p.print_indent();
     if decl.declare {
-        p.print_str("declare ");
+        p.print_keyword(b"declare ");
     }
     if decl.r#const {
-        p.print_str("const ");
+        p.print_keyword(b"const ");
     }
     p.print_space_before_identifier();
-    p.print_str("enum ");
+    p.print_keyword(b"enum ");
     decl.id.print(p, ctx);
     p.print_space_before_identifier();
     emit_ts_enum_body_impl(&decl.body, p, ctx);
@@ -5913,9 +5913,9 @@ fn emit_ts_enum_member_impl<'a>(member: &TSEnumMember<'a>, p: &mut Codegen<'a>, 
         TSEnumMemberName::ComputedTemplateString(template) => {
             let quasi = template.quasis.first().unwrap();
             p.add_source_mapping(quasi.span);
-            p.print_str("[`");
+            p.print_keyword(b"[`");
             p.print_str(quasi.value.raw.as_str());
-            p.print_str("`]");
+            p.print_keyword(b"`]");
         }
     }
     if let Some(initializer) = &member.initializer {
