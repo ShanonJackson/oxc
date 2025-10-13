@@ -96,7 +96,8 @@ impl FastBuffer {
             if capacity == 0 { 64 } else { capacity.next_power_of_two().max(64) };
         let current_capacity = self.buf.capacity();
         if current_capacity < aligned_capacity {
-            self.buf.reserve(aligned_capacity);
+            let additional = aligned_capacity - self.buf.len();
+            self.buf.reserve(additional);
         }
         self.buf.clear();
         self.len = 0;
@@ -266,7 +267,8 @@ impl FastBuffer {
         let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
             let target = new_len.next_power_of_two().max(64);
-            self.buf.reserve(target);
+            let additional = target - self.buf.len();
+            self.buf.reserve(additional);
         }
         debug_assert!(
             self.buf.capacity() >= new_len,
@@ -280,6 +282,7 @@ impl FastBuffer {
             ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
         self.len = new_len;
+        unsafe { self.buf.set_len(self.len) };
     }
 
     #[inline(always)]
@@ -288,13 +291,15 @@ impl FastBuffer {
             self.len.checked_add(1).expect("fast buffer length overflow while writing byte");
         if new_len > self.buf.capacity() {
             let target = new_len.next_power_of_two().max(64);
-            self.buf.reserve(target);
+            let additional = target - self.buf.len();
+            self.buf.reserve(additional);
         }
         unsafe {
             let dst = self.buf.as_mut_ptr().add(self.len);
             ptr::write(dst, byte);
         }
         self.len = new_len;
+        unsafe { self.buf.set_len(self.len) };
     }
 
     #[inline(always)]
@@ -304,7 +309,8 @@ impl FastBuffer {
         let new_len = self.len.checked_add(count).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
             let target = new_len.next_power_of_two().max(64);
-            self.buf.reserve(target);
+            let additional = target - self.buf.len();
+            self.buf.reserve(additional);
         }
 
         unsafe {
@@ -312,5 +318,6 @@ impl FastBuffer {
             ptr::write_bytes(dst, byte, count);
         }
         self.len = new_len;
+        unsafe { self.buf.set_len(self.len) };
     }
 }
