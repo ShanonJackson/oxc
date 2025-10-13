@@ -1,7 +1,5 @@
 use std::ops::Not;
 
-use cow_utils::CowUtils;
-
 use oxc_ast::ast::*;
 use oxc_span::GetSpan;
 use oxc_syntax::{
@@ -1328,13 +1326,7 @@ impl Gen for RegExpLiteral<'_> {
         // Avoid forming a single-line comment or "</script" sequence
         let last = p.last_byte();
         if last == Some(b'/')
-            || (last == Some(b'<')
-                && self
-                    .regex
-                    .pattern
-                    .text
-                    .get(..6)
-                    .is_some_and(|first_six| first_six.cow_to_ascii_lowercase() == "script"))
+            || (last == Some(b'<') && pattern_starts_with_script(self.regex.pattern.text.as_str()))
         {
             p.print_hard_space();
         }
@@ -1344,6 +1336,16 @@ impl Gen for RegExpLiteral<'_> {
         p.print_str(self.regex.flags.to_inline_string().as_str());
         p.prev_reg_exp_end = p.code().len();
     }
+}
+
+#[inline]
+fn pattern_starts_with_script(text: &str) -> bool {
+    const SCRIPT: [u8; 6] = *b"script";
+    let bytes = text.as_bytes();
+    if bytes.len() < SCRIPT.len() {
+        return false;
+    }
+    bytes.iter().zip(SCRIPT).all(|(&ch, expected)| ch.to_ascii_lowercase() == expected)
 }
 
 impl Gen for StringLiteral<'_> {

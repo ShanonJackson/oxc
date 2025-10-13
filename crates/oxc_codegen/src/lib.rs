@@ -7,8 +7,6 @@
 
 use std::borrow::Cow;
 
-use cow_utils::CowUtils;
-
 use oxc_ast::ast::*;
 use oxc_data_structures::{code_buffer::CodeBuffer, stack::Stack};
 use oxc_index::IndexVec;
@@ -789,13 +787,13 @@ impl<'a> Codegen<'a> {
             s = &s[1..];
         }
 
-        let mut best_candidate = s.cow_replacen("e+", "e", 1);
+        let mut best_candidate = strip_exponent_plus(s);
         let mut is_hex = false;
 
         // Track the best candidate found so far
         if num.fract() == 0.0 {
             // For integers, check hex format and other optimizations
-            let hex_candidate = format!("0x{:x}", num as u128);
+            let hex_candidate = format_lower_hex(num as u128);
             if hex_candidate.len() < best_candidate.len() {
                 is_hex = true;
                 best_candidate = hex_candidate.into();
@@ -804,15 +802,23 @@ impl<'a> Codegen<'a> {
         // Check for scientific notation optimizations for numbers starting with ".0"
         else if best_candidate.starts_with(".0") {
             // Skip the first '0' since we know it's there from the starts_with check
-            if let Some(i) = best_candidate.bytes().skip(2).position(|c| c != b'0') {
+            let candidate = best_candidate.as_ref();
+            if let Some(i) = candidate.as_bytes().iter().skip(2).position(|c| *c != b'0') {
                 let len = i + 2; // `+2` to include the dot and first zero.
-                let digits = &best_candidate[len..];
+                let digits = &candidate[len..];
                 let exp = digits.len() + len - 1;
-                let exp_str_len = itoa::Buffer::new().format(exp).len();
+                let mut exp_buf = itoa::Buffer::new();
+                let exp_str = exp_buf.format(exp);
+                let exp_str_len = exp_str.len();
                 // Calculate expected length: digits + 'e-' + exp_length
                 let expected_len = digits.len() + 2 + exp_str_len;
                 if expected_len < best_candidate.len() {
-                    best_candidate = format!("{digits}e-{exp}").into();
+                    let mut candidate_str = String::with_capacity(expected_len);
+                    candidate_str.push_str(digits);
+                    candidate_str.push('e');
+                    candidate_str.push('-');
+                    candidate_str.push_str(exp_str);
+                    best_candidate = candidate_str.into();
                     debug_assert_eq!(best_candidate.len(), expected_len);
                 }
             }
@@ -823,14 +829,21 @@ impl<'a> Codegen<'a> {
         // from being incorrectly converted to scientific notation
         if !is_hex
             && best_candidate.ends_with('0')
-            && let Some(len) = best_candidate.bytes().rev().position(|c| c != b'0')
+            && let Some(len) = best_candidate.as_ref().bytes().rev().position(|c| c != b'0')
         {
-            let base = &best_candidate[0..best_candidate.len() - len];
-            let exp_str_len = itoa::Buffer::new().format(len).len();
+            let candidate = best_candidate.as_ref();
+            let base = &candidate[0..candidate.len() - len];
+            let mut exp_buf = itoa::Buffer::new();
+            let exp_str = exp_buf.format(len);
+            let exp_str_len = exp_str.len();
             // Calculate expected length: base + 'e' + len
             let expected_len = base.len() + 1 + exp_str_len;
             if expected_len < best_candidate.len() {
-                best_candidate = format!("{base}e{len}").into();
+                let mut candidate_str = String::with_capacity(expected_len);
+                candidate_str.push_str(base);
+                candidate_str.push('e');
+                candidate_str.push_str(exp_str);
+                best_candidate = candidate_str.into();
                 debug_assert_eq!(best_candidate.len(), expected_len);
             }
         }
@@ -841,11 +854,18 @@ impl<'a> Codegen<'a> {
             .and_then(|(a, b)| b.split_once('e').map(|e| (a, e.0, e.1)))
         {
             let new_expr = exponent.parse::<isize>().unwrap() - point.len() as isize;
-            let new_exp_str_len = itoa::Buffer::new().format(new_expr).len();
+            let mut exp_buf = itoa::Buffer::new();
+            let new_exp_str = exp_buf.format(new_expr);
+            let new_exp_str_len = new_exp_str.len();
             // Calculate expected length: integer + point + 'e' + new_exp_str_len
             let expected_len = integer.len() + point.len() + 1 + new_exp_str_len;
             if expected_len < best_candidate.len() {
-                best_candidate = format!("{integer}{point}e{new_expr}").into();
+                let mut candidate_str = String::with_capacity(expected_len);
+                candidate_str.push_str(integer);
+                candidate_str.push_str(point);
+                candidate_str.push('e');
+                candidate_str.push_str(new_exp_str);
+                best_candidate = candidate_str.into();
                 debug_assert_eq!(best_candidate.len(), expected_len);
             }
         }
@@ -880,4 +900,40 @@ impl<'a> Codegen<'a> {
             sourcemap_builder.add_source_mapping_for_name(self.code.as_bytes(), span, name);
         }
     }
+}
+
+fn strip_exponent_plus(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if matches!(bytes[i], b'e' | b'E') && bytes[i + 1] == b'+' {
+            let mut out = String::with_capacity(s.len() - 1);
+            out.push_str(&s[..i + 1]);
+            out.push_str(&s[i + 2..]);
+            return Cow::Owned(out);
+        }
+    }
+    Cow::Borrowed(s)
+}
+
+fn format_lower_hex(mut value: u128) -> String {
+    const HEX: [char; 16] =
+        ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
+    if value == 0 {
+        return String::from("0x0");
+    }
+
+    let mut buf = [0usize; 32];
+    let mut len = 0;
+    while value != 0 {
+        buf[len] = (value & 0xF) as usize;
+        value >>= 4;
+        len += 1;
+    }
+
+    let mut out = String::with_capacity(2 + len);
+    out.push_str("0x");
+    for &idx in buf[..len].iter().rev() {
+        out.push(HEX[idx]);
+    }
+    out
 }
