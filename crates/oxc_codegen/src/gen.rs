@@ -1659,49 +1659,66 @@ impl Gen for PropertyKey<'_> {
 
 impl GenExpr for ArrowFunctionExpression<'_> {
     fn gen_expr(&self, p: &mut Codegen, precedence: Precedence, ctx: Context) {
-        p.wrap(precedence >= Precedence::Assign || self.pife, |p| {
-            if self.r#async {
-                p.print_space_before_identifier();
-                p.add_source_mapping(self.span);
-                p.print_str("async");
-                p.print_soft_space();
-            }
-            if let Some(type_parameters) = &self.type_parameters {
-                type_parameters.print(p, ctx);
-            }
-            let remove_params_wrap = p.options.minify
-                && self.params.items.len() == 1
-                && self.params.rest.is_none()
-                && self.type_parameters.is_none()
-                && self.return_type.is_none()
-                && {
-                    let param = &self.params.items[0];
-                    param.decorators.is_empty()
-                        && !param.has_modifier()
-                        && param.pattern.kind.is_binding_identifier()
-                        && param.pattern.type_annotation.is_none()
-                        && !param.pattern.optional
-                };
-            p.wrap(!remove_params_wrap, |p| {
-                self.params.print(p, ctx);
-            });
-            if let Some(return_type) = &self.return_type {
-                p.print_str(":");
-                p.print_soft_space();
-                return_type.print(p, ctx);
-            }
+        let needs_parens = precedence >= Precedence::Assign || self.pife;
+        if needs_parens {
+            p.print_ascii_byte(b'(');
+        }
+
+        if self.r#async {
+            p.print_space_before_identifier();
+            p.add_source_mapping(self.span);
+            p.print_str("async");
             p.print_soft_space();
-            p.print_str("=>");
+        }
+
+        if let Some(type_parameters) = &self.type_parameters {
+            type_parameters.print(p, ctx);
+        }
+
+        let remove_params_wrap = p.options.minify
+            && self.params.items.len() == 1
+            && self.params.rest.is_none()
+            && self.type_parameters.is_none()
+            && self.return_type.is_none()
+            && {
+                let param = &self.params.items[0];
+                param.decorators.is_empty()
+                    && !param.has_modifier()
+                    && param.pattern.kind.is_binding_identifier()
+                    && param.pattern.type_annotation.is_none()
+                    && !param.pattern.optional
+            };
+
+        if !remove_params_wrap {
+            p.print_ascii_byte(b'(');
+        }
+        self.params.print(p, ctx);
+        if !remove_params_wrap {
+            p.print_ascii_byte(b')');
+        }
+
+        if let Some(return_type) = &self.return_type {
+            p.print_str(":");
             p.print_soft_space();
-            if self.expression {
-                if let Some(Statement::ExpressionStatement(stmt)) = &self.body.statements.first() {
-                    p.start_of_arrow_expr = p.code_len();
-                    stmt.expression.print_expr(p, Precedence::Comma, ctx);
-                }
-            } else {
-                self.body.print(p, ctx);
+            return_type.print(p, ctx);
+        }
+
+        p.print_soft_space();
+        p.print_str("=>");
+        p.print_soft_space();
+
+        if self.expression {
+            if let Some(Statement::ExpressionStatement(stmt)) = &self.body.statements.first() {
+                p.start_of_arrow_expr = p.code_len();
+                stmt.expression.print_expr(p, Precedence::Comma, ctx);
             }
-        });
+        } else {
+            self.body.print(p, ctx);
+        }
+
+        if needs_parens {
+            p.print_ascii_byte(b')');
+        }
     }
 }
 

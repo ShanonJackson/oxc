@@ -5,7 +5,9 @@
 
 #![warn(missing_docs)]
 
-use std::{borrow::Cow, cmp, slice};
+use std::borrow::Cow;
+
+use memchr::memchr;
 
 use cow_utils::CowUtils;
 
@@ -35,7 +37,7 @@ use binary_expr_visitor::BinaryExpressionVisitor;
 use comment::CommentsMap;
 use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
-use str::{Quote, cold_branch, is_script_close_tag};
+use str::{Quote, is_script_close_tag};
 
 pub use context::Context;
 pub use r#gen::{Gen, GenExpr};
@@ -265,112 +267,43 @@ impl<'a> Codegen<'a> {
     /// Push str into the buffer, escaping `</script` to `<\/script`.
     #[inline]
     pub fn print_str_escaping_script_close_tag(&mut self, s: &str) {
-        // `</script` will be very rare. So we try to make the search as quick as possible by:
-        // 1. Searching for `<` first, and only checking if followed by `/script` once `<` is found.
-        // 2. Searching longer strings for `<` in chunks of 16 bytes using SIMD, and only doing the
-        //    more expensive byte-by-byte search once a `<` is found.
-
         let bytes = s.as_bytes();
-        let mut consumed = 0;
 
-        // Search range of bytes for `</script`, byte by byte.
-        //
-        // Bytes between `ptr` and `last_ptr` (inclusive) are searched for `<`.
-        // If `<` is found, the following 7 bytes are checked to see if they're `/script`.
-        //
-        // Requirements for the closure below:
-        // * `ptr` and `last_ptr` must be within bounds of `bytes`.
-        // * `last_ptr` must be greater or equal to `ptr`.
-        // * `last_ptr` must be no later than 8 bytes before end of string.
-        //   i.e. safe to read 8 bytes at `end_ptr`.
-        let mut search_bytes = |mut ptr: *const u8, last_ptr| {
-            loop {
-                // SAFETY: `ptr` is always less than or equal to `last_ptr`.
-                // `last_ptr` is within bounds of `bytes`, so safe to read a byte at `ptr`.
-                let byte = unsafe { *ptr.as_ref().unwrap_unchecked() };
-                if byte == b'<' {
-                    // SAFETY: `ptr <= last_ptr`, and `last_ptr` points to no later than
-                    // 8 bytes before end of string, so safe to read 8 bytes from `ptr`
-                    let slice = unsafe { slice::from_raw_parts(ptr, 8) };
-                    if is_script_close_tag(slice) {
-                        // Push str up to and including `<`. Skip `/`. Write `\/` instead.
-                        // SAFETY:
-                        // `consumed` is initially 0, and only updated below to be after `/`,
-                        // so in bounds, and on a UTF-8 char boundary.
-                        // `index` is on `<`, so `index + 1` is in bounds and a UTF-8 char boundary.
-                        // `consumed` is always less than `index + 1` as it's set on a previous round.
-                        unsafe {
-                            let index = ptr.offset_from_unsigned(bytes.as_ptr());
-                            let before = bytes.get_unchecked(consumed..=index);
-                            self.code.print_bytes_unchecked(before);
-
-                            // Set `consumed` to after `/`
-                            consumed = index + 2;
-                        }
-                        self.print_str("\\/");
-                        // Note: We could advance `ptr` by 8 bytes here to skip over `</script`,
-                        // but this branch will be very rarely taken, so it's better to keep it simple
-                    }
-                }
-
-                if ptr == last_ptr {
-                    break;
-                }
-                // SAFETY: `ptr` is less than `last_ptr`, which is in bounds, so safe to increment `ptr`
-                ptr = unsafe { ptr.add(1) };
-            }
-        };
-
-        // Search string in chunks of 16 bytes
-        let mut chunks = bytes.chunks_exact(16);
-        for (chunk_index, chunk) in chunks.by_ref().enumerate() {
-            #[expect(clippy::missing_panics_doc, reason = "infallible")]
-            let chunk: &[u8; 16] = chunk.try_into().unwrap();
-
-            // Compiler vectorizes this loop to a few SIMD ops
-            let mut contains_lt = false;
-            for &byte in chunk {
-                if byte == b'<' {
-                    contains_lt = true;
-                }
-            }
-
-            if contains_lt {
-                // Chunk contains at least one `<`.
-                // Find them, and check if they're the start of `</script`.
-                //
-                // SAFETY: `index` is byte index of start of chunk.
-                // We search bytes starting with first byte of chunk, and ending with last byte of chunk.
-                // i.e. `index` to `index + 15` (inclusive).
-                // If this chunk is towards the end of the string, reduce the range of bytes searched
-                // so the last byte searched has at least 7 further bytes after it.
-                // i.e. safe to read 8 bytes at `last_ptr`.
-                cold_branch(|| unsafe {
-                    let index = chunk_index * 16;
-                    let remaining_bytes = bytes.len() - index;
-                    let last_offset = cmp::min(remaining_bytes - 8, 15);
-                    let ptr = bytes.as_ptr().add(index);
-                    let last_ptr = ptr.add(last_offset);
-                    search_bytes(ptr, last_ptr);
-                });
-            }
+        // Fast path: strings shorter than the sentinel or without any `<` cannot contain
+        // `</script`, so we can avoid the chunked scan entirely.
+        if bytes.len() < 8 {
+            self.code.print_str(s);
+            return;
         }
 
-        // Search last chunk byte-by-byte.
-        // Skip this if less than 8 bytes remaining, because less than 8 bytes can't contain `</script`.
-        let last_chunk = chunks.remainder();
-        if last_chunk.len() >= 8 {
-            let ptr = last_chunk.as_ptr();
-            // SAFETY: `last_chunk.len() >= 8`, so `- 8` cannot wrap.
-            // `last_chunk.as_ptr().add(last_chunk.len() - 8)` is in bounds of `last_chunk`.
-            let last_ptr = unsafe { ptr.add(last_chunk.len() - 8) };
-            search_bytes(ptr, last_ptr);
+        let mut search_start = 0;
+        let mut output_start = 0;
+
+        while let Some(pos) = memchr(b'<', &bytes[search_start..]) {
+            let absolute = search_start + pos;
+            search_start = absolute + 1;
+
+            if absolute + 8 > bytes.len() || !is_script_close_tag(&bytes[absolute..absolute + 8]) {
+                continue;
+            }
+
+            // SAFETY: `output_start` and `absolute + 1` always refer to ASCII positions and
+            // therefore lie on valid UTF-8 boundaries. `output_start` only advances forwards.
+            unsafe {
+                let before = s.get_unchecked(output_start..absolute + 1);
+                self.code.print_str(before);
+            }
+
+            self.code.print_str("\\/");
+            output_start = absolute + 2;
+            search_start = output_start;
         }
 
-        // SAFETY: `consumed` is either 0, or after `/`, so on a UTF-8 char boundary, and in bounds
+        // SAFETY: `output_start` was last set to after `/`, so it is either still within bounds
+        // or equal to `bytes.len()`. In both cases the slice is valid.
         unsafe {
-            let remaining = bytes.get_unchecked(consumed..);
-            self.code.print_bytes_unchecked(remaining);
+            let remaining = s.get_unchecked(output_start..);
+            self.code.print_str(remaining);
         }
     }
 
