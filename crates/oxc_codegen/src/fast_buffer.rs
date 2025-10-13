@@ -1,6 +1,6 @@
 #![expect(clippy::redundant_pub_crate)]
 
-use std::{char, ptr, slice};
+use std::{char, ptr};
 
 use oxc_data_structures::code_buffer::{DEFAULT_INDENT_WIDTH, IndentChar};
 
@@ -177,12 +177,6 @@ impl FastBuffer {
                 _ => unreachable!("ASCII handled earlier"),
             })
         }
-    }
-
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `self.len` bytes were initialized via `write_bytes`.
-        unsafe { slice::from_raw_parts(self.buf.as_ptr(), self.len) }
     }
 
     pub fn into_string(mut self) -> String {

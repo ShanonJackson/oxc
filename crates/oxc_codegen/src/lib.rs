@@ -16,6 +16,7 @@ use oxc_data_structures::stack::Stack;
 use oxc_index::IndexVec;
 use oxc_semantic::Scoping;
 use oxc_span::{CompactStr, GetSpan, Span};
+use oxc_syntax::identifier::{LS, PS};
 use oxc_syntax::{
     class::ClassId,
     identifier::{is_identifier_part, is_identifier_part_ascii},
@@ -119,6 +120,14 @@ pub struct Codegen<'a> {
     /// Track the current indentation level
     indent: u32,
 
+    /// Current generated source position for sourcemap tracking
+    generated_line: u32,
+    generated_column: u32,
+
+    /// Tracks whether the previous byte was a carriage return so we can treat "\r\n"
+    /// as a single newline for sourcemap accounting.
+    pending_cr: bool,
+
     /// Fast path for [CodegenOptions::single_quote]
     quote: Quote,
 
@@ -174,6 +183,9 @@ impl<'a> Codegen<'a> {
             start_of_default_export: 0,
             is_jsx: false,
             indent: 0,
+            generated_line: 0,
+            generated_column: 0,
+            pending_cr: false,
             quote: Quote::Double,
             comments: CommentsMap::default(),
             sourcemap_builder: None,
@@ -186,6 +198,9 @@ impl<'a> Codegen<'a> {
         self.quote = if options.single_quote { Quote::Single } else { Quote::Double };
         self.code = FastBuffer::with_indent(options.indent_char, options.indent_width);
         self.options = options;
+        self.generated_line = 0;
+        self.generated_column = 0;
+        self.pending_cr = false;
         self
     }
 
@@ -254,12 +269,14 @@ impl<'a> Codegen<'a> {
     /// Panics if `byte` is not an ASCII byte (`0 - 0x7F`).
     #[inline(always)]
     pub fn print_ascii_byte(&mut self, byte: u8) {
+        self.advance_ascii_byte(byte);
         self.code.print_ascii_byte(byte);
     }
 
     /// Push str into the buffer
     #[inline(always)]
     pub fn print_str(&mut self, s: &str) {
+        self.advance_str(s);
         self.code.print_str(s);
     }
 
@@ -267,6 +284,7 @@ impl<'a> Codegen<'a> {
     #[inline(always)]
     pub fn print_keyword(&mut self, keyword: &'static [u8]) {
         debug_assert!(keyword.iter().all(u8::is_ascii));
+        self.advance_ascii_bytes(keyword.len());
         unsafe {
             self.code.print_bytes_unchecked(keyword);
         }
@@ -312,7 +330,8 @@ impl<'a> Codegen<'a> {
                         unsafe {
                             let index = ptr.offset_from_unsigned(bytes.as_ptr());
                             let before = bytes.get_unchecked(consumed..=index);
-                            self.code.print_bytes_unchecked(before);
+                            let before_str = std::str::from_utf8_unchecked(before);
+                            self.print_str(before_str);
 
                             // Set `consumed` to after `/`
                             consumed = index + 2;
@@ -380,7 +399,8 @@ impl<'a> Codegen<'a> {
         // SAFETY: `consumed` is either 0, or after `/`, so on a UTF-8 char boundary, and in bounds
         unsafe {
             let remaining = bytes.get_unchecked(consumed..);
-            self.code.print_bytes_unchecked(remaining);
+            let remaining_str = std::str::from_utf8_unchecked(remaining);
+            self.print_str(remaining_str);
         }
     }
 
@@ -419,6 +439,9 @@ impl<'a> Codegen<'a> {
         self.next_class_id = ClassId::from_usize(0);
         self.comments.clear();
         self.code.clear();
+        self.generated_line = 0;
+        self.generated_column = 0;
+        self.pending_cr = false;
     }
 
     fn prepare_pass(&mut self, program: &Program<'a>, capacity: usize) {
@@ -430,6 +453,125 @@ impl<'a> Codegen<'a> {
             self.sourcemap_builder = None;
         }
         self.build_comments(&program.comments);
+    }
+
+    #[inline(always)]
+    fn sourcemap_enabled(&self) -> bool {
+        self.sourcemap_builder.is_some()
+    }
+
+    #[inline(always)]
+    fn advance_ascii_byte(&mut self, byte: u8) {
+        if !self.sourcemap_enabled() {
+            return;
+        }
+        match byte {
+            b'\r' => {
+                self.generated_line += 1;
+                self.generated_column = 0;
+                self.pending_cr = true;
+            }
+            b'\n' => {
+                if self.pending_cr {
+                    self.pending_cr = false;
+                } else {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
+                }
+            }
+            _ => {
+                self.generated_column += 1;
+                self.pending_cr = false;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn advance_ascii_bytes(&mut self, len: usize) {
+        if self.sourcemap_enabled() && len != 0 {
+            self.generated_column += len as u32;
+            self.pending_cr = false;
+        }
+    }
+
+    #[inline(always)]
+    fn advance_str(&mut self, text: &str) {
+        if !self.sourcemap_enabled() || text.is_empty() {
+            return;
+        }
+
+        if text.is_ascii() {
+            let bytes = text.as_bytes();
+            let mut idx = 0;
+            while idx < bytes.len() {
+                match bytes[idx] {
+                    b'\r' => {
+                        self.generated_line += 1;
+                        self.generated_column = 0;
+                        idx += 1;
+                        if idx < bytes.len() && bytes[idx] == b'\n' {
+                            idx += 1;
+                            self.pending_cr = false;
+                        } else {
+                            self.pending_cr = true;
+                        }
+                    }
+                    b'\n' => {
+                        if self.pending_cr {
+                            self.pending_cr = false;
+                        } else {
+                            self.generated_line += 1;
+                            self.generated_column = 0;
+                        }
+                        idx += 1;
+                    }
+                    _ => {
+                        let start = idx;
+                        while idx < bytes.len() && !matches!(bytes[idx], b'\n' | b'\r') {
+                            idx += 1;
+                        }
+                        self.generated_column += (idx - start) as u32;
+                        self.pending_cr = false;
+                    }
+                }
+            }
+            return;
+        }
+
+        let mut chars = text.chars().peekable();
+        let mut pending_cr = self.pending_cr;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' => {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
+                    if matches!(chars.peek(), Some('\n')) {
+                        chars.next();
+                        pending_cr = false;
+                    } else {
+                        pending_cr = true;
+                    }
+                }
+                '\n' => {
+                    if pending_cr {
+                        pending_cr = false;
+                    } else {
+                        self.generated_line += 1;
+                        self.generated_column = 0;
+                    }
+                }
+                ch if ch == LS || ch == PS => {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
+                    pending_cr = false;
+                }
+                ch => {
+                    self.generated_column += ch.len_utf16() as u32;
+                    pending_cr = false;
+                }
+            }
+        }
+        self.pending_cr = pending_cr;
     }
 
     #[inline]
@@ -553,6 +695,10 @@ impl<'a> Codegen<'a> {
             self.print_hard_space();
             self.print_next_indent_as_space = false;
             return;
+        }
+        if self.indent != 0 {
+            let width = self.options.indent_width.saturating_mul(self.indent as usize);
+            self.advance_ascii_bytes(width);
         }
         self.code.print_indent(self.indent as usize);
     }
@@ -928,7 +1074,12 @@ impl<'a> Codegen<'a> {
         if let Some(sourcemap_builder) = self.sourcemap_builder.as_mut()
             && !span.is_empty()
         {
-            sourcemap_builder.add_source_mapping(self.code.as_bytes(), span.start, None);
+            sourcemap_builder.add_source_mapping(
+                self.generated_line,
+                self.generated_column,
+                span.start,
+                None,
+            );
         }
     }
 
@@ -936,7 +1087,12 @@ impl<'a> Codegen<'a> {
         if let Some(sourcemap_builder) = self.sourcemap_builder.as_mut()
             && !span.is_empty()
         {
-            sourcemap_builder.add_source_mapping(self.code.as_bytes(), span.end, None);
+            sourcemap_builder.add_source_mapping(
+                self.generated_line,
+                self.generated_column,
+                span.end,
+                None,
+            );
         }
     }
 
@@ -944,7 +1100,60 @@ impl<'a> Codegen<'a> {
         if let Some(sourcemap_builder) = self.sourcemap_builder.as_mut()
             && !span.is_empty()
         {
-            sourcemap_builder.add_source_mapping_for_name(self.code.as_bytes(), span, name);
+            sourcemap_builder.add_source_mapping_for_name(
+                self.generated_line,
+                self.generated_column,
+                span,
+                name,
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn codegen_with_sourcemap() -> Codegen<'static> {
+        let mut codegen = Codegen::new();
+        codegen.sourcemap_builder = Some(SourcemapBuilder::new(Path::new("input.js"), ""));
+        codegen
+    }
+
+    #[test]
+    fn tracks_ascii_bytes_and_newlines() {
+        let mut codegen = codegen_with_sourcemap();
+        codegen.print_ascii_byte(b'a');
+        assert_eq!((codegen.generated_line, codegen.generated_column), (0, 1));
+
+        codegen.print_ascii_byte(b'\n');
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 0));
+    }
+
+    #[test]
+    fn tracks_carriage_return_sequences() {
+        let mut codegen = codegen_with_sourcemap();
+        codegen.print_str("\r");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 0));
+
+        codegen.print_str("\n");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 0));
+
+        codegen.print_str("x");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 1));
+    }
+
+    #[test]
+    fn tracks_utf16_width_and_line_separators() {
+        let mut codegen = codegen_with_sourcemap();
+        codegen.print_str("🙂");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (0, 2));
+
+        codegen.print_str("\u{2028}");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (1, 0));
+
+        codegen.print_str("\u{2029}z");
+        assert_eq!((codegen.generated_line, codegen.generated_column), (2, 1));
     }
 }
