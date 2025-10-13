@@ -11,8 +11,6 @@ use std::{borrow::Cow, cmp, slice};
 
 use cow_utils::CowUtils;
 
-use memchr::memchr2;
-
 use oxc_ast::ast::*;
 use oxc_data_structures::stack::Stack;
 use oxc_index::IndexVec;
@@ -37,12 +35,14 @@ mod operator;
 mod options;
 mod sourcemap_builder;
 mod str;
+mod utf8;
 
 use binary_expr_visitor::BinaryExpressionVisitor;
 use comment::CommentsMap;
 use fast_buffer::FastBuffer;
 use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
+use utf8::{decode_utf8_from_lead, utf8_lead_byte_width};
 
 use str::{Quote, cold_branch, is_script_close_tag};
 
@@ -501,58 +501,64 @@ impl<'a> Codegen<'a> {
             return;
         }
 
-        if text.is_ascii() {
-            let mut bytes = text.as_bytes();
-            let mut pending_cr = self.pending_cr;
-
-            while let Some(rel_idx) = memchr2(b'\r', b'\n', bytes) {
-                if rel_idx != 0 {
-                    self.generated_column += rel_idx as u32;
-                    pending_cr = false;
-                }
-
-                let newline = bytes[rel_idx];
-                bytes = &bytes[rel_idx + 1..];
-
-                if newline == b'\r' {
-                    self.generated_line += 1;
-                    self.generated_column = 0;
-                    if !bytes.is_empty() && bytes[0] == b'\n' {
-                        bytes = &bytes[1..];
-                        pending_cr = false;
-                    } else {
-                        pending_cr = true;
-                    }
-                } else if pending_cr {
-                    pending_cr = false;
-                } else {
-                    self.generated_line += 1;
-                    self.generated_column = 0;
-                }
-            }
-
-            if !bytes.is_empty() {
-                self.generated_column += bytes.len() as u32;
-                pending_cr = false;
-            }
-
-            self.pending_cr = pending_cr;
-            return;
-        }
-
-        let mut chars = text.chars().peekable();
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut idx = 0usize;
         let mut pending_cr = self.pending_cr;
-        while let Some(ch) = chars.next() {
+        let ptr = bytes.as_ptr();
+
+        while idx < len {
+            let byte = unsafe { *ptr.add(idx) };
+            if byte < 0x80 {
+                match byte {
+                    b'\r' => {
+                        self.generated_line += 1;
+                        self.generated_column = 0;
+                        idx += 1;
+                        if idx < len && unsafe { *ptr.add(idx) } == b'\n' {
+                            idx += 1;
+                            pending_cr = false;
+                        } else {
+                            pending_cr = true;
+                        }
+                        continue;
+                    }
+                    b'\n' => {
+                        idx += 1;
+                        if pending_cr {
+                            pending_cr = false;
+                        } else {
+                            self.generated_line += 1;
+                            self.generated_column = 0;
+                        }
+                        continue;
+                    }
+                    _ => {
+                        let start = idx;
+                        idx += 1;
+                        while idx < len {
+                            let b = unsafe { *ptr.add(idx) };
+                            if b >= 0x80 || b == b'\r' || b == b'\n' {
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        self.generated_column += (idx - start) as u32;
+                        pending_cr = false;
+                        continue;
+                    }
+                }
+            }
+
+            let width = utf8_lead_byte_width(byte);
+            debug_assert!(idx + width <= len);
+            let ch = unsafe { decode_utf8_from_lead(byte, ptr.add(idx + 1), width) };
+            idx += width;
             match ch {
                 '\r' => {
                     self.generated_line += 1;
                     self.generated_column = 0;
-                    if matches!(chars.peek(), Some('\n')) {
-                        chars.next();
-                        pending_cr = false;
-                    } else {
-                        pending_cr = true;
-                    }
+                    pending_cr = true;
                 }
                 '\n' => {
                     if pending_cr {
@@ -573,6 +579,7 @@ impl<'a> Codegen<'a> {
                 }
             }
         }
+
         self.pending_cr = pending_cr;
     }
 

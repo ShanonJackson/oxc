@@ -1,69 +1,16 @@
 #![expect(clippy::redundant_pub_crate)]
 
-use std::{char, ptr};
+use std::ptr;
 
 use oxc_data_structures::code_buffer::{DEFAULT_INDENT_WIDTH, IndentChar};
+
+use crate::utf8::{decode_utf8_from_lead, utf8_lead_byte_width};
 
 pub(crate) struct FastBuffer {
     buf: Vec<u8>,
     len: usize,
     indent_char: IndentChar,
     indent_width: usize,
-}
-
-#[inline(always)]
-const fn utf8_lead_byte_width(byte: u8) -> usize {
-    if byte & 0x80 == 0 {
-        1
-    } else if byte & 0xE0 == 0xC0 {
-        2
-    } else if byte & 0xF0 == 0xE0 {
-        3
-    } else {
-        4
-    }
-}
-
-#[inline(always)]
-unsafe fn decode_two(lead: u8, cont: *const u8) -> char {
-    let b2 = unsafe { *cont };
-    debug_assert_eq!(lead & 0xE0, 0xC0);
-    debug_assert_eq!(b2 & 0xC0, 0x80);
-    let code = ((lead & 0x1F) as u32) << 6 | (b2 & 0x3F) as u32;
-    debug_assert!(char::from_u32(code).is_some());
-    unsafe { char::from_u32_unchecked(code) }
-}
-
-#[inline(always)]
-unsafe fn decode_three(lead: u8, cont: *const u8) -> char {
-    let b2 = unsafe { *cont };
-    let cont1 = unsafe { cont.add(1) };
-    let b3 = unsafe { *cont1 };
-    debug_assert_eq!(lead & 0xF0, 0xE0);
-    debug_assert_eq!(b2 & 0xC0, 0x80);
-    debug_assert_eq!(b3 & 0xC0, 0x80);
-    let code = ((lead & 0x0F) as u32) << 12 | ((b2 & 0x3F) as u32) << 6 | (b3 & 0x3F) as u32;
-    debug_assert!(char::from_u32(code).is_some());
-    unsafe { char::from_u32_unchecked(code) }
-}
-
-#[inline(always)]
-unsafe fn decode_four(lead: u8, cont: *const u8) -> char {
-    let b2 = unsafe { *cont };
-    let cont1 = unsafe { cont.add(1) };
-    let b3 = unsafe { *cont1 };
-    let cont2 = unsafe { cont.add(2) };
-    let b4 = unsafe { *cont2 };
-    debug_assert_eq!(lead & 0xF8, 0xF0);
-    debug_assert_eq!(b2 & 0xC0, 0x80);
-    debug_assert_eq!(b3 & 0xC0, 0x80);
-    debug_assert_eq!(b4 & 0xC0, 0x80);
-    let code = ((lead & 0x07) as u32) << 18
-        | ((b2 & 0x3F) as u32) << 12
-        | ((b3 & 0x3F) as u32) << 6
-        | (b4 & 0x3F) as u32;
-    debug_assert!(char::from_u32(code).is_some());
-    unsafe { char::from_u32_unchecked(code) }
 }
 
 impl Default for FastBuffer {
@@ -171,12 +118,7 @@ impl FastBuffer {
             }
             let slice_ptr = ptr.add(index);
 
-            Some(match width {
-                2 => decode_two(byte, slice_ptr.add(1)),
-                3 => decode_three(byte, slice_ptr.add(1)),
-                4 => decode_four(byte, slice_ptr.add(1)),
-                _ => unreachable!("ASCII handled earlier"),
-            })
+            Some(decode_utf8_from_lead(byte, slice_ptr.add(1), width))
         }
     }
 
