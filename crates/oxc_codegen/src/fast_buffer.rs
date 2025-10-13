@@ -53,7 +53,8 @@ impl FastBuffer {
         let aligned_capacity =
             if capacity == 0 { 64 } else { capacity.next_power_of_two().max(64) };
         if self.buf.capacity() < aligned_capacity {
-            self.buf = Vec::with_capacity(aligned_capacity);
+            let additional = aligned_capacity.saturating_sub(self.buf.len());
+            self.buf.reserve(additional);
         }
         unsafe {
             self.buf.set_len(0);
@@ -122,7 +123,7 @@ impl FastBuffer {
 
     #[inline(always)]
     pub fn print_ascii_byte(&mut self, byte: u8) {
-        assert!(byte.is_ascii(), "byte {byte} is not ASCII");
+        debug_assert!(byte.is_ascii(), "byte {byte} is not ASCII");
         self.write_single_byte(byte);
     }
 
@@ -178,15 +179,7 @@ impl FastBuffer {
             return;
         }
         let byte = self.indent_char as u8;
-        let chunk = [byte; 32];
-        let mut remaining = count;
-        while remaining >= chunk.len() {
-            self.write_bytes(&chunk);
-            remaining -= chunk.len();
-        }
-        if remaining > 0 {
-            self.write_bytes(&chunk[..remaining]);
-        }
+        self.write_repeat_byte(byte, count);
     }
 
     #[inline]
@@ -246,6 +239,46 @@ impl FastBuffer {
         unsafe {
             let dst = self.buf.as_mut_ptr().add(self.len);
             ptr::write(dst, byte);
+            self.len = new_len;
+            self.buf.set_len(new_len);
+        }
+    }
+
+    #[inline(always)]
+    fn write_repeat_byte(&mut self, byte: u8, count: usize) {
+        debug_assert_ne!(count, 0);
+        debug_assert_eq!(self.buf.len(), self.len);
+
+        if count >= TAIL_CAPACITY {
+            self.tail.fill(byte);
+            self.tail_len = TAIL_CAPACITY;
+        } else {
+            let mut tail_len = self.tail_len;
+            let required = tail_len + count;
+            if required > TAIL_CAPACITY {
+                let drop = required - TAIL_CAPACITY;
+                if drop >= tail_len {
+                    tail_len = 0;
+                } else {
+                    self.tail.copy_within(drop..tail_len, 0);
+                    tail_len -= drop;
+                }
+            }
+            let end = tail_len + count;
+            self.tail[tail_len..end].fill(byte);
+            self.tail_len = end;
+        }
+
+        let new_len = self.len.checked_add(count).expect("buffer length overflow");
+        if new_len > self.buf.capacity() {
+            let target = new_len.next_power_of_two().max(64);
+            let additional = target - self.buf.len();
+            self.buf.reserve_exact(additional);
+        }
+
+        unsafe {
+            let dst = self.buf.as_mut_ptr().add(self.len);
+            ptr::write_bytes(dst, byte, count);
             self.len = new_len;
             self.buf.set_len(new_len);
         }
