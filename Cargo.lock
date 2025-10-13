@@ -1934,7 +1934,6 @@ dependencies = [
  "dragonbox_ecma",
  "insta",
  "itoa",
- "memchr",
  "oxc_allocator 0.94.0",
  "oxc_ast 0.94.0",
  "oxc_data_structures 0.94.0",

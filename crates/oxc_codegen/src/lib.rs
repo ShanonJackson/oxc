@@ -7,8 +7,6 @@
 
 use std::borrow::Cow;
 
-use memchr::memchr;
-
 use cow_utils::CowUtils;
 
 use oxc_ast::ast::*;
@@ -37,7 +35,7 @@ use binary_expr_visitor::BinaryExpressionVisitor;
 use comment::CommentsMap;
 use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
-use str::{Quote, is_script_close_tag};
+use str::Quote;
 
 pub use context::Context;
 pub use r#gen::{Gen, GenExpr};
@@ -276,33 +274,82 @@ impl<'a> Codegen<'a> {
             return;
         }
 
-        let mut search_start = 0;
-        let mut output_start = 0;
+        const BYTE_REPEAT: u64 = 0x0101_0101_0101_0101;
+        const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+        const LT_REPEATED: u64 = u64::from_ne_bytes([b'<'; 8]);
+        const CASE_FOLD_MASK: u64 = u64::from_ne_bytes([0, 0, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]);
+        const SCRIPT_CLOSING: u64 = u64::from_ne_bytes(*b"</script");
 
-        while let Some(pos) = memchr(b'<', &bytes[search_start..]) {
-            let absolute = search_start + pos;
-            search_start = absolute + 1;
+        let mut consumed = 0;
+        let mut index = 0;
+        let ptr = bytes.as_ptr();
+        let len = bytes.len();
 
-            if absolute + 8 > bytes.len() || !is_script_close_tag(&bytes[absolute..absolute + 8]) {
+        while index + 8 <= len {
+            // SAFETY: `index + 8 <= len` guarantees that reading 8 bytes from `ptr.add(index)` is valid.
+            let chunk = unsafe { ptr.add(index).cast::<u64>().read_unaligned() };
+            let diff = chunk ^ LT_REPEATED;
+            let matches = diff.wrapping_sub(BYTE_REPEAT) & !diff & HIGH_BITS;
+
+            if matches == 0 {
+                index += 8;
                 continue;
             }
 
-            // SAFETY: `output_start` and `absolute + 1` always refer to ASCII positions and
-            // therefore lie on valid UTF-8 boundaries. `output_start` only advances forwards.
-            unsafe {
-                let before = s.get_unchecked(output_start..absolute + 1);
-                self.code.print_str(before);
+            let offset = (matches.trailing_zeros() as usize) >> 3;
+            index += offset;
+
+            if index + 8 > len {
+                break;
             }
 
-            self.code.print_str("\\/");
-            output_start = absolute + 2;
-            search_start = output_start;
+            // SAFETY: `index + 8 <= len` checked above.
+            let candidate =
+                unsafe { ptr.add(index).cast::<u64>().read_unaligned() } | CASE_FOLD_MASK;
+            if candidate == SCRIPT_CLOSING {
+                // SAFETY: `consumed` only ever increases and always points to a UTF-8 boundary.
+                unsafe {
+                    let before = s.get_unchecked(consumed..=index);
+                    self.code.print_str(before);
+                }
+
+                self.code.print_str("\\/");
+                consumed = index + 2;
+                index += 2;
+                continue;
+            }
+
+            index += 1;
         }
 
-        // SAFETY: `output_start` was last set to after `/`, so it is either still within bounds
-        // or equal to `bytes.len()`. In both cases the slice is valid.
+        while index < len {
+            if bytes[index] == b'<' {
+                if index + 8 > len {
+                    break;
+                }
+
+                // SAFETY: `index + 8 <= len` ensures the read is within bounds.
+                let candidate =
+                    unsafe { ptr.add(index).cast::<u64>().read_unaligned() } | CASE_FOLD_MASK;
+                if candidate == SCRIPT_CLOSING {
+                    unsafe {
+                        let before = s.get_unchecked(consumed..=index);
+                        self.code.print_str(before);
+                    }
+
+                    self.code.print_str("\\/");
+                    consumed = index + 2;
+                    index += 2;
+                    continue;
+                }
+            }
+
+            index += 1;
+        }
+
+        // SAFETY: `consumed` is always on a UTF-8 boundary and within bounds of `s`.
         unsafe {
-            let remaining = s.get_unchecked(output_start..);
+            let remaining = s.get_unchecked(consumed..);
             self.code.print_str(remaining);
         }
     }
