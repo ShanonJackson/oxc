@@ -41,13 +41,6 @@ use fast_buffer::FastBuffer;
 use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
 
-const TWO_PASS_HEURISTIC: usize = 4 * 1024;
-
-#[derive(Clone, Copy)]
-enum PassMode {
-    Measure,
-    Emit { capacity: usize },
-}
 use str::{Quote, cold_branch, is_script_close_tag};
 
 pub use context::Context;
@@ -232,18 +225,8 @@ impl<'a> Codegen<'a> {
     pub fn build(mut self, program: &Program<'a>) -> CodegenReturn {
         self.quote = if self.options.single_quote { Quote::Single } else { Quote::Double };
         self.source_text = Some(program.source_text);
-        let use_two_pass = program.source_text.len() > TWO_PASS_HEURISTIC;
-
-        if use_two_pass {
-            self.prepare_pass(program, PassMode::Measure);
-            program.print(&mut self, Context::default());
-            let measured_len = self.code.len();
-            self.prepare_pass(program, PassMode::Emit { capacity: measured_len });
-        } else {
-            let initial_capacity =
-                program.source_text.len().saturating_add(program.comments.len() * 8);
-            self.prepare_pass(program, PassMode::Emit { capacity: initial_capacity });
-        }
+        let estimated_capacity = Self::estimate_emit_capacity(program);
+        self.prepare_pass(program, estimated_capacity);
 
         program.print(&mut self, Context::default());
         let legal_comments = self.handle_eof_linked_or_external_comments(program);
@@ -438,27 +421,22 @@ impl<'a> Codegen<'a> {
         self.code.clear();
     }
 
-    fn prepare_pass(&mut self, program: &Program<'a>, mode: PassMode) {
+    fn prepare_pass(&mut self, program: &Program<'a>, capacity: usize) {
         self.reset_core_state();
-        match mode {
-            PassMode::Measure => {
-                self.code.start_measurement(self.options.indent_char, self.options.indent_width);
-                self.sourcemap_builder = None;
-            }
-            PassMode::Emit { capacity } => {
-                self.code.start_emission(
-                    capacity,
-                    self.options.indent_char,
-                    self.options.indent_width,
-                );
-                if let Some(path) = &self.options.source_map_path {
-                    self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));
-                } else {
-                    self.sourcemap_builder = None;
-                }
-            }
+        self.code.start_emission(capacity, self.options.indent_char, self.options.indent_width);
+        if let Some(path) = &self.options.source_map_path {
+            self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));
+        } else {
+            self.sourcemap_builder = None;
         }
         self.build_comments(&program.comments);
+    }
+
+    #[inline]
+    fn estimate_emit_capacity(program: &Program<'_>) -> usize {
+        let base = program.source_text.len();
+        let comment_slack = program.comments.len() * 8;
+        base.saturating_add(comment_slack)
     }
 
     #[inline(always)]

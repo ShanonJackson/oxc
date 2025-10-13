@@ -6,13 +6,9 @@ use oxc_data_structures::code_buffer::{DEFAULT_INDENT_WIDTH, IndentChar};
 
 const TAIL_CAPACITY: usize = 64;
 
-enum Mode {
-    Measure { len: usize },
-    Emit { buf: Vec<u8>, len: usize },
-}
-
 pub(crate) struct FastBuffer {
-    mode: Mode,
+    buf: Vec<u8>,
+    len: usize,
     indent_char: IndentChar,
     indent_width: usize,
     tail: [u8; TAIL_CAPACITY],
@@ -28,7 +24,8 @@ impl Default for FastBuffer {
 impl FastBuffer {
     pub fn new() -> Self {
         Self {
-            mode: Mode::Emit { buf: Vec::new(), len: 0 },
+            buf: Vec::new(),
+            len: 0,
             indent_char: IndentChar::default(),
             indent_width: DEFAULT_INDENT_WIDTH,
             tail: [0; TAIL_CAPACITY],
@@ -38,19 +35,13 @@ impl FastBuffer {
 
     pub fn with_indent(indent_char: IndentChar, indent_width: usize) -> Self {
         Self {
-            mode: Mode::Emit { buf: Vec::new(), len: 0 },
+            buf: Vec::new(),
+            len: 0,
             indent_char,
             indent_width,
             tail: [0; TAIL_CAPACITY],
             tail_len: 0,
         }
-    }
-
-    pub fn start_measurement(&mut self, indent_char: IndentChar, indent_width: usize) {
-        self.mode = Mode::Measure { len: 0 };
-        self.indent_char = indent_char;
-        self.indent_width = indent_width;
-        self.tail_len = 0;
     }
 
     pub fn start_emission(
@@ -61,7 +52,8 @@ impl FastBuffer {
     ) {
         let aligned_capacity =
             if capacity == 0 { 64 } else { capacity.next_power_of_two().max(64) };
-        self.mode = Mode::Emit { buf: Vec::with_capacity(aligned_capacity), len: 0 };
+        self.buf = Vec::with_capacity(aligned_capacity);
+        self.len = 0;
         self.indent_char = indent_char;
         self.indent_width = indent_width;
         self.tail_len = 0;
@@ -69,18 +61,13 @@ impl FastBuffer {
 
     #[inline]
     pub fn len(&self) -> usize {
-        match &self.mode {
-            Mode::Measure { len } | Mode::Emit { len, .. } => *len,
-        }
+        self.len
     }
 
     #[inline]
     #[expect(dead_code)]
     pub fn capacity(&self) -> usize {
-        match &self.mode {
-            Mode::Measure { .. } => usize::MAX,
-            Mode::Emit { buf, .. } => buf.capacity(),
-        }
+        self.buf.capacity()
     }
 
     #[inline]
@@ -92,13 +79,9 @@ impl FastBuffer {
     pub fn peek_nth_byte_back(&self, n: usize) -> Option<u8> {
         if n < self.tail_len {
             Some(self.tail[self.tail_len - 1 - n])
-        } else if let Mode::Emit { buf, len } = &self.mode {
-            if n < *len {
-                // SAFETY: `n < len`, so pointer is in bounds
-                unsafe { Some(*buf.as_ptr().add(*len - 1 - n)) }
-            } else {
-                None
-            }
+        } else if n < self.len {
+            // SAFETY: `n < self.len`, so pointer is in bounds
+            unsafe { Some(*self.buf.as_ptr().add(self.len - 1 - n)) }
         } else {
             None
         }
@@ -110,37 +93,26 @@ impl FastBuffer {
             return None;
         }
         decode_last_char(&self.tail[..self.tail_len]).or_else(|| {
-            if let Mode::Emit { buf, len } = &self.mode {
-                if *len == 0 {
-                    None
-                } else {
-                    // SAFETY: `len` bytes were written.
-                    let slice = unsafe { slice::from_raw_parts(buf.as_ptr(), *len) };
-                    decode_last_char(slice)
-                }
-            } else {
+            if self.len == 0 {
                 None
+            } else {
+                // SAFETY: `self.len` bytes were written.
+                let slice = unsafe { slice::from_raw_parts(self.buf.as_ptr(), self.len) };
+                decode_last_char(slice)
             }
         })
     }
 
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        match &self.mode {
-            Mode::Measure { .. } => panic!("measurement buffer does not expose bytes"),
-            Mode::Emit { buf, len } => unsafe { slice::from_raw_parts(buf.as_ptr(), *len) },
-        }
+        // SAFETY: `self.len` bytes were initialized via `write_bytes`.
+        unsafe { slice::from_raw_parts(self.buf.as_ptr(), self.len) }
     }
 
     pub fn into_string(mut self) -> String {
-        match &mut self.mode {
-            Mode::Measure { .. } => panic!("cannot materialize string in measurement mode"),
-            Mode::Emit { buf, len } => {
-                unsafe { buf.set_len(*len) };
-                // SAFETY: all writes ensure UTF-8 correctness.
-                unsafe { String::from_utf8_unchecked(std::mem::take(buf)) }
-            }
-        }
+        unsafe { self.buf.set_len(self.len) };
+        // SAFETY: all writes ensure UTF-8 correctness.
+        unsafe { String::from_utf8_unchecked(std::mem::take(&mut self.buf)) }
     }
 
     #[inline(always)]
@@ -175,14 +147,12 @@ impl FastBuffer {
     {
         let iter = bytes.into_iter();
         let hint = iter.size_hint();
-        if let Mode::Emit { buf, len } = &mut self.mode {
-            let additional = hint.1.unwrap_or(hint.0);
-            if additional > 0 {
-                let required = len.checked_add(additional).expect("buffer length overflow");
-                if required > buf.capacity() {
-                    let target = required.next_power_of_two().max(64);
-                    buf.reserve(target);
-                }
+        let additional = hint.1.unwrap_or(hint.0);
+        if additional > 0 {
+            let required = self.len.checked_add(additional).expect("buffer length overflow");
+            if required > self.buf.capacity() {
+                let target = required.next_power_of_two().max(64);
+                self.buf.reserve(target);
             }
         }
         for byte in iter {
@@ -216,10 +186,7 @@ impl FastBuffer {
 
     #[inline]
     pub fn clear(&mut self) {
-        let len = match &mut self.mode {
-            Mode::Measure { len } | Mode::Emit { len, .. } => len,
-        };
-        *len = 0;
+        self.len = 0;
         self.tail_len = 0;
     }
 
@@ -228,23 +195,16 @@ impl FastBuffer {
             return;
         }
         self.update_tail(bytes);
-        match &mut self.mode {
-            Mode::Measure { len } => {
-                *len = len.checked_add(bytes.len()).expect("buffer length overflow");
-            }
-            Mode::Emit { buf, len } => {
-                let new_len = len.checked_add(bytes.len()).expect("buffer length overflow");
-                if new_len > buf.capacity() {
-                    let target = new_len.next_power_of_two().max(64);
-                    buf.reserve(target);
-                }
-                unsafe {
-                    let dst = buf.as_mut_ptr().add(*len);
-                    ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
-                }
-                *len = new_len;
-            }
+        let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
+        if new_len > self.buf.capacity() {
+            let target = new_len.next_power_of_two().max(64);
+            self.buf.reserve(target);
         }
+        unsafe {
+            let dst = self.buf.as_mut_ptr().add(self.len);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        }
+        self.len = new_len;
     }
 
     fn update_tail(&mut self, bytes: &[u8]) {
