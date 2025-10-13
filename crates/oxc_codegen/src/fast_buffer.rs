@@ -8,6 +8,10 @@ use crate::utf8::{decode_utf8_from_lead, utf8_lead_byte_width};
 
 pub(crate) struct FastBuffer {
     buf: Vec<u8>,
+    base_ptr: *mut u8,
+    write_ptr: *mut u8,
+    capacity: usize,
+    len_synced: bool,
     len: usize,
     indent_char: IndentChar,
     indent_width: usize,
@@ -23,6 +27,10 @@ impl FastBuffer {
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
+            base_ptr: ptr::null_mut(),
+            write_ptr: ptr::null_mut(),
+            capacity: 0,
+            len_synced: true,
             len: 0,
             indent_char: IndentChar::default(),
             indent_width: DEFAULT_INDENT_WIDTH,
@@ -30,7 +38,16 @@ impl FastBuffer {
     }
 
     pub fn with_indent(indent_char: IndentChar, indent_width: usize) -> Self {
-        Self { buf: Vec::new(), len: 0, indent_char, indent_width }
+        Self {
+            buf: Vec::new(),
+            base_ptr: ptr::null_mut(),
+            write_ptr: ptr::null_mut(),
+            capacity: 0,
+            len_synced: true,
+            len: 0,
+            indent_char,
+            indent_width,
+        }
     }
 
     pub fn start_emission(
@@ -41,13 +58,18 @@ impl FastBuffer {
     ) {
         let aligned_capacity =
             if capacity == 0 { 64 } else { capacity.next_power_of_two().max(64) };
-        let current_capacity = self.buf.capacity();
-        if current_capacity < aligned_capacity {
-            let additional = aligned_capacity - self.buf.len();
+        self.sync_len();
+        if self.capacity < aligned_capacity {
+            let additional = aligned_capacity - self.len;
             self.buf.reserve(additional);
+            self.refresh_pointers();
         }
         self.buf.clear();
         self.len = 0;
+        self.len_synced = true;
+        self.capacity = self.buf.capacity();
+        self.base_ptr = self.buf.as_mut_ptr();
+        self.write_ptr = self.base_ptr;
         self.indent_char = indent_char;
         self.indent_width = indent_width;
     }
@@ -68,8 +90,8 @@ impl FastBuffer {
         if self.len == 0 {
             None
         } else {
-            // SAFETY: `self.len > 0` so `self.len - 1` is in bounds.
-            unsafe { Some(*self.buf.as_ptr().add(self.len - 1)) }
+            // SAFETY: `self.len > 0` so `self.write_ptr.offset(-1)` is in bounds.
+            unsafe { Some(*self.write_ptr.sub(1)) }
         }
     }
 
@@ -77,7 +99,7 @@ impl FastBuffer {
     pub fn peek_nth_byte_back(&self, n: usize) -> Option<u8> {
         if n < self.len {
             // SAFETY: `n < self.len`, so pointer is in bounds.
-            unsafe { Some(*self.buf.as_ptr().add(self.len - 1 - n)) }
+            unsafe { Some(*self.write_ptr.sub(n + 1)) }
         } else {
             None
         }
@@ -90,7 +112,7 @@ impl FastBuffer {
         }
 
         unsafe {
-            let ptr = self.buf.as_ptr();
+            let ptr = self.base_ptr as *const u8;
             let mut index = self.len - 1;
             let mut byte = *ptr.add(index);
 
@@ -123,7 +145,7 @@ impl FastBuffer {
     }
 
     pub fn into_string(mut self) -> String {
-        unsafe { self.buf.set_len(self.len) };
+        self.sync_len();
         // SAFETY: all writes ensure UTF-8 correctness.
         unsafe { String::from_utf8_unchecked(std::mem::take(&mut self.buf)) }
     }
@@ -162,11 +184,7 @@ impl FastBuffer {
         let hint = iter.size_hint();
         let additional = hint.1.unwrap_or(hint.0);
         if additional > 0 {
-            let required = self.len.checked_add(additional).expect("buffer length overflow");
-            if required > self.buf.capacity() {
-                let target = required.next_power_of_two().max(64);
-                self.buf.reserve(target);
-            }
+            self.ensure_capacity(additional);
         }
         for byte in iter {
             self.print_ascii_byte(byte);
@@ -191,10 +209,13 @@ impl FastBuffer {
 
     #[inline]
     pub fn clear(&mut self) {
+        self.sync_len();
+        self.buf.clear();
         self.len = 0;
-        unsafe {
-            self.buf.set_len(0);
-        }
+        self.capacity = self.buf.capacity();
+        self.base_ptr = self.buf.as_mut_ptr();
+        self.write_ptr = self.base_ptr;
+        self.len_synced = true;
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) {
@@ -206,60 +227,70 @@ impl FastBuffer {
             }
             _ => {}
         }
-        let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
-        if new_len > self.buf.capacity() {
-            let target = new_len.next_power_of_two().max(64);
-            let additional = target - self.buf.len();
-            self.buf.reserve(additional);
-        }
-        debug_assert!(
-            self.buf.capacity() >= new_len,
-            "fast buffer capacity {} shorter than required {} (len {} bytes)",
-            self.buf.capacity(),
-            new_len,
-            bytes.len()
-        );
+        let len = bytes.len();
+        self.ensure_capacity(len);
         unsafe {
-            let dst = self.buf.as_mut_ptr().add(self.len);
-            ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+            ptr::copy_nonoverlapping(bytes.as_ptr(), self.write_ptr, len);
+            self.write_ptr = self.write_ptr.add(len);
         }
-        self.len = new_len;
-        unsafe { self.buf.set_len(self.len) };
+        self.len = self.len.checked_add(len).expect("buffer length overflow");
+        self.len_synced = false;
     }
 
     #[inline(always)]
     fn write_single_byte(&mut self, byte: u8) {
-        let new_len =
-            self.len.checked_add(1).expect("fast buffer length overflow while writing byte");
-        if new_len > self.buf.capacity() {
-            let target = new_len.next_power_of_two().max(64);
-            let additional = target - self.buf.len();
-            self.buf.reserve(additional);
-        }
+        self.ensure_capacity(1);
         unsafe {
-            let dst = self.buf.as_mut_ptr().add(self.len);
-            ptr::write(dst, byte);
+            ptr::write(self.write_ptr, byte);
+            self.write_ptr = self.write_ptr.add(1);
         }
-        self.len = new_len;
-        unsafe { self.buf.set_len(self.len) };
+        self.len = self.len.checked_add(1).expect("fast buffer length overflow while writing byte");
+        self.len_synced = false;
     }
 
     #[inline(always)]
     fn write_repeat_byte(&mut self, byte: u8, count: usize) {
         debug_assert_ne!(count, 0);
 
-        let new_len = self.len.checked_add(count).expect("buffer length overflow");
-        if new_len > self.buf.capacity() {
-            let target = new_len.next_power_of_two().max(64);
-            let additional = target - self.buf.len();
-            self.buf.reserve(additional);
-        }
-
+        self.ensure_capacity(count);
         unsafe {
-            let dst = self.buf.as_mut_ptr().add(self.len);
-            ptr::write_bytes(dst, byte, count);
+            ptr::write_bytes(self.write_ptr, byte, count);
+            self.write_ptr = self.write_ptr.add(count);
         }
-        self.len = new_len;
-        unsafe { self.buf.set_len(self.len) };
+        self.len = self.len.checked_add(count).expect("buffer length overflow");
+        self.len_synced = false;
+    }
+
+    #[inline(always)]
+    fn ensure_capacity(&mut self, additional: usize) {
+        if additional == 0 {
+            return;
+        }
+        let required = self.len.checked_add(additional).expect("buffer length overflow");
+        if required > self.capacity {
+            let target = required.next_power_of_two().max(64);
+            self.sync_len();
+            let additional = target - self.len;
+            self.buf.reserve(additional);
+            self.refresh_pointers();
+        }
+    }
+
+    #[inline(always)]
+    fn sync_len(&mut self) {
+        if !self.len_synced {
+            unsafe { self.buf.set_len(self.len) };
+            self.len_synced = true;
+        }
+    }
+
+    #[inline(always)]
+    fn refresh_pointers(&mut self) {
+        self.base_ptr = self.buf.as_mut_ptr();
+        self.capacity = self.buf.capacity();
+        unsafe {
+            self.write_ptr = self.base_ptr.add(self.len);
+        }
+        self.len_synced = true;
     }
 }
