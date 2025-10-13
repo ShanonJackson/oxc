@@ -168,13 +168,17 @@ impl FastBuffer {
         let additional = hint.1.unwrap_or(hint.0);
         if additional > 0 {
             let required = self.len.checked_add(additional).expect("buffer length overflow");
-            if required > self.buf.capacity() {
-                let target = Self::align_capacity(required);
-                self.buf.reserve(target - self.buf.capacity());
-                #[cfg(debug_assertions)]
-                {
+            #[cfg(debug_assertions)]
+            {
+                let prev_capacity = self.buf.capacity();
+                self.ensure_capacity(required);
+                if self.buf.capacity() != prev_capacity {
                     self.metrics.reallocations += 1;
                 }
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                self.ensure_capacity(required);
             }
         }
         for byte in iter {
@@ -224,13 +228,17 @@ impl FastBuffer {
             self.metrics.written_bytes += bytes.len();
         }
         let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
-        if new_len > self.buf.capacity() {
-            let target = Self::align_capacity(new_len);
-            self.buf.reserve(target);
-            #[cfg(debug_assertions)]
-            {
+        #[cfg(debug_assertions)]
+        {
+            let prev_capacity = self.buf.capacity();
+            self.ensure_capacity(new_len);
+            if self.buf.capacity() != prev_capacity {
                 self.metrics.reallocations += 1;
             }
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            self.ensure_capacity(new_len);
         }
         debug_assert!(
             self.buf.capacity() >= new_len,
@@ -250,6 +258,22 @@ impl FastBuffer {
             last_char = decode_last_char(slice);
         }
         self.last_char = last_char;
+    }
+
+    #[inline]
+    fn ensure_capacity(&mut self, required: usize) {
+        if required <= self.buf.capacity() {
+            return;
+        }
+        let mut target = Self::align_capacity(required);
+        let doubled = self.buf.capacity().saturating_mul(2).max(MIN_CAPACITY);
+        if target < doubled {
+            target = Self::align_capacity(doubled);
+        }
+        let additional = target.saturating_sub(self.buf.capacity());
+        if additional > 0 {
+            self.buf.reserve(additional);
+        }
     }
 }
 

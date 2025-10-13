@@ -1,16 +1,22 @@
-use std::fmt::Write;
+use std::{borrow::Cow, fmt::Write, sync::OnceLock};
 
-pub fn offline_fixture(filename: &str) -> Option<String> {
+pub fn offline_fixture(filename: &str) -> Option<Cow<'static, str>> {
     match filename {
-        "RadixUIAdoptionSection.jsx" => Some(radix_ui_adoption_section()),
-        "react.development.js" => Some(react_development_js()),
-        "cal.com.tsx" => Some(cal_com_tsx()),
-        "binder.ts" => Some(binder_ts()),
+        "RadixUIAdoptionSection.jsx" => Some(Cow::Borrowed(radix_ui_adoption_section())),
+        "react.development.js" => Some(Cow::Borrowed(react_development_js())),
+        "cal.com.tsx" => Some(Cow::Borrowed(cal_com_tsx())),
+        "binder.ts" => Some(Cow::Borrowed(binder_ts())),
         _ => None,
     }
 }
 
-fn radix_ui_adoption_section() -> String {
+fn stash(source: String, slot: &OnceLock<&'static str>) -> &'static str {
+    slot.get_or_init(|| Box::leak(source.into_boxed_str()))
+}
+
+fn radix_ui_adoption_section() -> &'static str {
+    static CACHE: OnceLock<&'static str> = OnceLock::new();
+
     let mut out = String::from("import * as React from 'react';\n");
     out.push_str("const highlights = [\n");
     out.push_str("  { title: 'Accessible', description: 'Radix primitives embrace accessibility by default.' },\n");
@@ -55,11 +61,13 @@ fn radix_ui_adoption_section() -> String {
     out.push_str("export function useRadixHighlights() {\n");
     out.push_str("  return React.useMemo(() => highlights.map(item => ({ ...item })), []);\n");
     out.push_str("}\n");
-    out
+    stash(out, &CACHE)
 }
 
-fn react_development_js() -> String {
-    let mut out = String::with_capacity(950_000);
+fn react_development_js() -> &'static str {
+    static CACHE: OnceLock<&'static str> = OnceLock::new();
+
+    let mut out = String::with_capacity(1_600_000);
     out.push_str("// Offline React development fixture for benchmarks.\n");
     out.push_str("const REACT_ELEMENT_TYPE = Symbol.for('react.element');\n");
     out.push_str("export const Fragment = Symbol.for('react.fragment');\n");
@@ -84,7 +92,7 @@ fn react_development_js() -> String {
     out.push_str("function identity(value) {\n");
     out.push_str("  return value;\n");
     out.push_str("}\n");
-    for i in 0..8192 {
+    for i in 0..2560 {
         let _ = writeln!(out, "export function Component{0}(props) {{", i);
         out.push_str("  const [getValue, setValue] = useState(() => props.seed ?? 0);\n");
         out.push_str("  const derived = useMemo(() => ({\n");
@@ -106,11 +114,13 @@ fn react_development_js() -> String {
         out.push_str("}\n");
         let _ = writeln!(out, "Component{0}.defaultProps = {{ role: 'region' }};", i);
     }
-    out
+    stash(out, &CACHE)
 }
 
-fn cal_com_tsx() -> String {
-    let mut out = String::with_capacity(650_000);
+fn cal_com_tsx() -> &'static str {
+    static CACHE: OnceLock<&'static str> = OnceLock::new();
+
+    let mut out = String::with_capacity(1_000_000);
     out.push_str("import { useEffect, useMemo, useState } from 'react';\n");
     out.push_str("type Slot<T = Date> = {\n");
     out.push_str("  id: string;\n  start: T;\n  end: T;\n  resources: readonly string[];\n};\n");
@@ -128,7 +138,7 @@ fn cal_com_tsx() -> String {
     out.push_str("  const fmt = new Intl.DateTimeFormat('en', {\n");
     out.push_str("    hour: 'numeric', minute: '2-digit', timeZone: tz ?? 'UTC'\n  });\n");
     out.push_str("  return `${fmt.format(start)} – ${fmt.format(end)}`;\n}\n");
-    for i in 0..512 {
+    for i in 0..640 {
         let _ = writeln!(
             out,
             "export function CalendarView{0}<T extends Slot>(props: CalendarProps<T>) {{",
@@ -178,11 +188,13 @@ fn cal_com_tsx() -> String {
         out.push_str("  );\n");
         out.push_str("}\n");
     }
-    out
+    stash(out, &CACHE)
 }
 
-fn binder_ts() -> String {
-    let mut out = String::with_capacity(420_000);
+fn binder_ts() -> &'static str {
+    static CACHE: OnceLock<&'static str> = OnceLock::new();
+
+    let mut out = String::with_capacity(600_000);
     out.push_str("export type BinderSymbol = string & { readonly __binder: unique symbol };\n");
     out.push_str("export interface BindingFlags {\n");
     out.push_str("  exported: boolean;\n  ambient: boolean;\n  optional: boolean;\n}\n");
@@ -221,5 +233,5 @@ fn binder_ts() -> String {
         out.push_str("  }\n");
         out.push_str("}\n");
     }
-    out
+    stash(out, &CACHE)
 }

@@ -127,7 +127,7 @@ impl TestFile {
                         std::fs::create_dir_all(parent).map_err(err_to_string)?;
                     }
                     std::fs::write(&file, code.as_bytes()).map_err(err_to_string)?;
-                    Ok((filename.to_string(), code))
+                    Ok((filename.to_string(), code.into_owned()))
                 } else {
                     Err(format!("{e:?}"))
                 }
