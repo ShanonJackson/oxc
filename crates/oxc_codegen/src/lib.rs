@@ -11,6 +11,8 @@ use std::{borrow::Cow, cmp, slice};
 
 use cow_utils::CowUtils;
 
+use memchr::memchr2;
+
 use oxc_ast::ast::*;
 use oxc_data_structures::stack::Stack;
 use oxc_index::IndexVec;
@@ -135,6 +137,7 @@ pub struct Codegen<'a> {
     comments: CommentsMap,
 
     sourcemap_builder: Option<SourcemapBuilder<'a>>,
+    track_sourcemap: bool,
 }
 
 impl Default for Codegen<'_> {
@@ -189,6 +192,7 @@ impl<'a> Codegen<'a> {
             quote: Quote::Double,
             comments: CommentsMap::default(),
             sourcemap_builder: None,
+            track_sourcemap: false,
         }
     }
 
@@ -442,11 +446,13 @@ impl<'a> Codegen<'a> {
         self.generated_line = 0;
         self.generated_column = 0;
         self.pending_cr = false;
+        self.track_sourcemap = false;
     }
 
     fn prepare_pass(&mut self, program: &Program<'a>, capacity: usize) {
         self.reset_core_state();
         self.code.start_emission(capacity, self.options.indent_char, self.options.indent_width);
+        self.track_sourcemap = self.options.source_map_path.is_some();
         if let Some(path) = &self.options.source_map_path {
             self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));
         } else {
@@ -456,13 +462,8 @@ impl<'a> Codegen<'a> {
     }
 
     #[inline(always)]
-    fn sourcemap_enabled(&self) -> bool {
-        self.sourcemap_builder.is_some()
-    }
-
-    #[inline(always)]
     fn advance_ascii_byte(&mut self, byte: u8) {
-        if !self.sourcemap_enabled() {
+        if !self.track_sourcemap {
             return;
         }
         match byte {
@@ -488,7 +489,7 @@ impl<'a> Codegen<'a> {
 
     #[inline(always)]
     fn advance_ascii_bytes(&mut self, len: usize) {
-        if self.sourcemap_enabled() && len != 0 {
+        if self.track_sourcemap && len != 0 {
             self.generated_column += len as u32;
             self.pending_cr = false;
         }
@@ -496,45 +497,46 @@ impl<'a> Codegen<'a> {
 
     #[inline(always)]
     fn advance_str(&mut self, text: &str) {
-        if !self.sourcemap_enabled() || text.is_empty() {
+        if !self.track_sourcemap || text.is_empty() {
             return;
         }
 
         if text.is_ascii() {
-            let bytes = text.as_bytes();
-            let mut idx = 0;
-            while idx < bytes.len() {
-                match bytes[idx] {
-                    b'\r' => {
-                        self.generated_line += 1;
-                        self.generated_column = 0;
-                        idx += 1;
-                        if idx < bytes.len() && bytes[idx] == b'\n' {
-                            idx += 1;
-                            self.pending_cr = false;
-                        } else {
-                            self.pending_cr = true;
-                        }
+            let mut bytes = text.as_bytes();
+            let mut pending_cr = self.pending_cr;
+
+            while let Some(rel_idx) = memchr2(b'\r', b'\n', bytes) {
+                if rel_idx != 0 {
+                    self.generated_column += rel_idx as u32;
+                    pending_cr = false;
+                }
+
+                let newline = bytes[rel_idx];
+                bytes = &bytes[rel_idx + 1..];
+
+                if newline == b'\r' {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
+                    if !bytes.is_empty() && bytes[0] == b'\n' {
+                        bytes = &bytes[1..];
+                        pending_cr = false;
+                    } else {
+                        pending_cr = true;
                     }
-                    b'\n' => {
-                        if self.pending_cr {
-                            self.pending_cr = false;
-                        } else {
-                            self.generated_line += 1;
-                            self.generated_column = 0;
-                        }
-                        idx += 1;
-                    }
-                    _ => {
-                        let start = idx;
-                        while idx < bytes.len() && !matches!(bytes[idx], b'\n' | b'\r') {
-                            idx += 1;
-                        }
-                        self.generated_column += (idx - start) as u32;
-                        self.pending_cr = false;
-                    }
+                } else if pending_cr {
+                    pending_cr = false;
+                } else {
+                    self.generated_line += 1;
+                    self.generated_column = 0;
                 }
             }
+
+            if !bytes.is_empty() {
+                self.generated_column += bytes.len() as u32;
+                pending_cr = false;
+            }
+
+            self.pending_cr = pending_cr;
             return;
         }
 
@@ -1118,6 +1120,7 @@ mod tests {
     fn codegen_with_sourcemap() -> Codegen<'static> {
         let mut codegen = Codegen::new();
         codegen.sourcemap_builder = Some(SourcemapBuilder::new(Path::new("input.js"), ""));
+        codegen.track_sourcemap = true;
         codegen
     }
 
