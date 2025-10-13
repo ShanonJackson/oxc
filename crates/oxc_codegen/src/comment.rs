@@ -1,6 +1,6 @@
-use std::{borrow::Cow, iter::FusedIterator};
+use std::{borrow::Cow, cell::Cell, iter::FusedIterator};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use oxc_ast::{Comment, CommentKind, ast::Program};
 use oxc_syntax::identifier::is_line_terminator;
@@ -11,7 +11,122 @@ use crate::{
     str::{LS_LAST_2_BYTES, LS_OR_PS_FIRST_BYTE, PS_LAST_2_BYTES},
 };
 
-pub type CommentsMap = FxHashMap</* attached_to */ u32, Vec<Comment>>;
+#[derive(Default)]
+pub struct CommentsMap {
+    keys: Vec<u32>,
+    values: Vec<Option<Vec<Comment>>>,
+    remaining: usize,
+    cached_lookup: Cell<Option<(u32, usize)>>,
+}
+
+impl CommentsMap {
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.values.clear();
+        self.remaining = 0;
+        self.cached_lookup.set(None);
+    }
+
+    fn rebuild(&mut self, mut items: Vec<(u32, Comment)>) {
+        if items.is_empty() {
+            self.clear();
+            return;
+        }
+
+        items.sort_unstable_by_key(|(start, _)| *start);
+
+        self.keys.clear();
+        self.values.clear();
+        self.keys.reserve(items.len());
+        self.values.reserve(items.len());
+
+        let mut index = 0;
+        while index < items.len() {
+            let start = items[index].0;
+            self.keys.push(start);
+
+            let mut group = Vec::new();
+            while index < items.len() && items[index].0 == start {
+                group.push(items[index].1);
+                index += 1;
+            }
+            self.values.push(Some(group));
+        }
+
+        self.remaining = self.values.len();
+        self.cached_lookup.set(None);
+    }
+
+    #[inline]
+    fn find_index(&self, start: u32) -> Option<usize> {
+        match self.keys.binary_search(&start) {
+            Ok(index) => Some(index),
+            Err(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+
+    #[inline]
+    pub fn has(&self, start: u32) -> bool {
+        if self.remaining == 0 {
+            self.cached_lookup.set(None);
+            return false;
+        }
+
+        if let Some((cached_start, index)) = self.cached_lookup.get() {
+            if cached_start == start {
+                return self.values.get(index).is_some_and(|value| value.is_some());
+            }
+        }
+
+        let Some(index) = self.find_index(start) else {
+            self.cached_lookup.set(None);
+            return false;
+        };
+
+        self.cached_lookup.set(Some((start, index)));
+        self.values.get(index).is_some_and(|value| value.is_some())
+    }
+
+    #[inline]
+    pub fn take(&mut self, start: u32) -> Option<Vec<Comment>> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let index = if let Some((cached_start, index)) = self.cached_lookup.get() {
+            if cached_start == start {
+                index
+            } else {
+                let index = self.find_index(start)?;
+                self.cached_lookup.set(Some((start, index)));
+                index
+            }
+        } else {
+            let index = self.find_index(start)?;
+            self.cached_lookup.set(Some((start, index)));
+            index
+        };
+
+        let Some(value) = self.values.get_mut(index) else {
+            return None;
+        };
+        let comments = value.take()?;
+        self.remaining -= 1;
+
+        if self.remaining == 0
+            || self.cached_lookup.get().is_some_and(|(_, cached_index)| cached_index == index)
+        {
+            self.cached_lookup.set(None);
+        }
+
+        Some(comments)
+    }
+}
 
 /// Custom iterator that splits text on line terminators while handling CRLF as a single unit.
 /// This avoids creating empty strings between CR and LF characters.
@@ -176,8 +291,13 @@ fn find_byte(bytes: &[u8], target: u8) -> Option<usize> {
 impl Codegen<'_> {
     pub(crate) fn build_comments(&mut self, comments: &[Comment]) {
         if self.options.comments == CommentOptions::disabled() {
+            self.comments.clear();
             return;
         }
+
+        let mut filtered = Vec::new();
+        filtered.reserve(comments.len());
+
         for comment in comments {
             // Omit pure comments because they are handled separately.
             if comment.is_pure() || comment.is_no_side_effects() {
@@ -199,18 +319,20 @@ impl Codegen<'_> {
                 }
             }
             if add {
-                self.comments.entry(comment.attached_to).or_default().push(*comment);
+                filtered.push((comment.attached_to, *comment));
             }
         }
+
+        self.comments.rebuild(filtered);
     }
 
     #[inline]
     pub(crate) fn has_comment(&self, start: u32) -> bool {
-        !self.comments.is_empty() && self.comments.contains_key(&start)
+        self.comments.has(start)
     }
 
     pub(crate) fn print_leading_comments(&mut self, start: u32) {
-        if let Some(comments) = self.comments.remove(&start) {
+        if let Some(comments) = self.comments.take(start) {
             self.print_comments(&comments);
         }
     }
@@ -219,7 +341,7 @@ impl Codegen<'_> {
         if self.comments.is_empty() {
             return None;
         }
-        self.comments.remove(&start)
+        self.comments.take(start)
     }
 
     #[inline]
@@ -233,7 +355,7 @@ impl Codegen<'_> {
         if self.comments.is_empty() {
             return false;
         }
-        let Some(comments) = self.comments.remove(&start) else { return false };
+        let Some(comments) = self.comments.take(start) else { return false };
 
         for comment in &comments {
             self.print_hard_newline();
