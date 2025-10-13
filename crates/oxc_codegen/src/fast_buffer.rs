@@ -13,6 +13,7 @@ pub(crate) struct FastBuffer {
     indent_width: usize,
     tail: [u8; TAIL_CAPACITY],
     tail_len: usize,
+    tail_head: usize,
 }
 
 impl Default for FastBuffer {
@@ -30,6 +31,7 @@ impl FastBuffer {
             indent_width: DEFAULT_INDENT_WIDTH,
             tail: [0; TAIL_CAPACITY],
             tail_len: 0,
+            tail_head: 0,
         }
     }
 
@@ -41,6 +43,7 @@ impl FastBuffer {
             indent_width,
             tail: [0; TAIL_CAPACITY],
             tail_len: 0,
+            tail_head: 0,
         }
     }
 
@@ -63,6 +66,7 @@ impl FastBuffer {
         self.indent_char = indent_char;
         self.indent_width = indent_width;
         self.tail_len = 0;
+        self.tail_head = 0;
     }
 
     #[inline]
@@ -78,13 +82,13 @@ impl FastBuffer {
 
     #[inline]
     pub fn last_byte(&self) -> Option<u8> {
-        if self.tail_len == 0 { None } else { Some(self.tail[self.tail_len - 1]) }
+        if self.tail_len == 0 { None } else { Some(self.tail_byte_from_back(0)) }
     }
 
     #[inline]
     pub fn peek_nth_byte_back(&self, n: usize) -> Option<u8> {
         if n < self.tail_len {
-            Some(self.tail[self.tail_len - 1 - n])
+            Some(self.tail_byte_from_back(n))
         } else if n < self.len {
             // SAFETY: `n < self.len`, so pointer is in bounds
             unsafe { Some(*self.buf.as_ptr().add(self.len - 1 - n)) }
@@ -98,15 +102,36 @@ impl FastBuffer {
         if self.tail_len == 0 {
             return None;
         }
-        decode_last_char(&self.tail[..self.tail_len]).or_else(|| {
-            if self.len == 0 {
-                None
-            } else {
-                // SAFETY: `self.len` bytes were written.
-                let slice = unsafe { slice::from_raw_parts(self.buf.as_ptr(), self.len) };
-                decode_last_char(slice)
+
+        let mut buf = [0u8; 4];
+        let mut filled = 0;
+        for offset in 0..self.tail_len.min(4) {
+            let byte = self.tail_byte_from_back(offset);
+            buf[3 - offset] = byte;
+            filled += 1;
+            if byte & 0b1100_0000 != 0b1000_0000 {
+                let start = 4 - filled;
+                return str::from_utf8(&buf[start..]).ok().and_then(|s| s.chars().next());
             }
-        })
+        }
+
+        if self.len <= self.tail_len {
+            return None;
+        }
+
+        let mut offset = self.tail_len;
+        while filled < 4 && offset < self.len {
+            let byte = unsafe { *self.buf.as_ptr().add(self.len - 1 - offset) };
+            buf[3 - filled] = byte;
+            filled += 1;
+            if byte & 0b1100_0000 != 0b1000_0000 {
+                let start = 4 - filled;
+                return str::from_utf8(&buf[start..]).ok().and_then(|s| s.chars().next());
+            }
+            offset += 1;
+        }
+
+        None
     }
 
     #[inline]
@@ -186,6 +211,7 @@ impl FastBuffer {
     pub fn clear(&mut self) {
         self.len = 0;
         self.tail_len = 0;
+        self.tail_head = 0;
         unsafe {
             self.buf.set_len(0);
         }
@@ -249,25 +275,7 @@ impl FastBuffer {
         debug_assert_ne!(count, 0);
         debug_assert_eq!(self.buf.len(), self.len);
 
-        if count >= TAIL_CAPACITY {
-            self.tail.fill(byte);
-            self.tail_len = TAIL_CAPACITY;
-        } else {
-            let mut tail_len = self.tail_len;
-            let required = tail_len + count;
-            if required > TAIL_CAPACITY {
-                let drop = required - TAIL_CAPACITY;
-                if drop >= tail_len {
-                    tail_len = 0;
-                } else {
-                    self.tail.copy_within(drop..tail_len, 0);
-                    tail_len -= drop;
-                }
-            }
-            let end = tail_len + count;
-            self.tail[tail_len..end].fill(byte);
-            self.tail_len = end;
-        }
+        self.update_tail_repeat(byte, count);
 
         let new_len = self.len.checked_add(count).expect("buffer length overflow");
         if new_len > self.buf.capacity() {
@@ -286,12 +294,11 @@ impl FastBuffer {
 
     #[inline(always)]
     fn push_tail_byte(&mut self, byte: u8) {
+        let idx = self.tail_head;
+        self.tail[idx] = byte;
+        self.tail_head = (idx + 1) % TAIL_CAPACITY;
         if self.tail_len < TAIL_CAPACITY {
-            self.tail[self.tail_len] = byte;
             self.tail_len += 1;
-        } else {
-            self.tail.copy_within(1..TAIL_CAPACITY, 0);
-            self.tail[TAIL_CAPACITY - 1] = byte;
         }
     }
 
@@ -303,39 +310,36 @@ impl FastBuffer {
             let start = bytes.len() - TAIL_CAPACITY;
             self.tail.copy_from_slice(&bytes[start..]);
             self.tail_len = TAIL_CAPACITY;
+            self.tail_head = 0;
             return;
         }
 
-        let required = self.tail_len + bytes.len();
-        if required > TAIL_CAPACITY {
-            let drop = required - TAIL_CAPACITY;
-            if drop >= self.tail_len {
-                self.tail_len = 0;
-            } else {
-                self.tail.copy_within(drop..self.tail_len, 0);
-                self.tail_len -= drop;
+        for &byte in bytes {
+            self.push_tail_byte(byte);
+        }
+    }
+
+    fn update_tail_repeat(&mut self, byte: u8, mut count: usize) {
+        if count >= TAIL_CAPACITY {
+            self.tail.fill(byte);
+            self.tail_len = TAIL_CAPACITY;
+            self.tail_head = 0;
+            count %= TAIL_CAPACITY;
+            if count == 0 {
+                return;
             }
         }
-        let start = self.tail_len;
-        let end = start + bytes.len();
-        self.tail[start..end].copy_from_slice(bytes);
-        self.tail_len = end;
-    }
-}
 
-fn decode_last_char(bytes: &[u8]) -> Option<char> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut index = bytes.len();
-    while index > 0 {
-        index -= 1;
-        let byte = bytes[index];
-        if byte & 0b1100_0000 != 0b1000_0000 {
-            // SAFETY: Slice is guaranteed UTF-8 by construction.
-            let slice = unsafe { bytes.get_unchecked(index..) };
-            return str::from_utf8(slice).ok().and_then(|s| s.chars().next());
+        for _ in 0..count {
+            self.push_tail_byte(byte);
         }
     }
-    None
+
+    #[inline]
+    fn tail_byte_from_back(&self, n: usize) -> u8 {
+        debug_assert!(n < self.tail_len);
+        let base = self.tail_head + TAIL_CAPACITY - 1;
+        let idx = base.wrapping_sub(n) % TAIL_CAPACITY;
+        unsafe { *self.tail.get_unchecked(idx) }
+    }
 }
