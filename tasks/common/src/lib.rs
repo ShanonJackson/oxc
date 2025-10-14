@@ -2,7 +2,6 @@
 use std::path::{Path, PathBuf};
 
 mod diff;
-mod offline_fixtures;
 mod request;
 mod snapshot;
 mod test_file;

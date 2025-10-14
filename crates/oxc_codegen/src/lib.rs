@@ -40,7 +40,7 @@ use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
 
 enum PassMode {
-    Emit { capacity: usize },
+    Emit { capacity: usize, trace_metrics: bool },
 }
 use str::{Quote, cold_branch, is_script_close_tag};
 
@@ -227,9 +227,34 @@ impl<'a> Codegen<'a> {
         self.quote = if self.options.single_quote { Quote::Single } else { Quote::Double };
         self.source_text = Some(program.source_text);
         let planned_capacity = self.estimate_output_capacity(program);
-        self.prepare_pass(program, PassMode::Emit { capacity: planned_capacity });
+        let trace_capacity = std::env::var("OXCCODEGEN_TRACE_CAP").is_ok();
+        let large_program = program.source_text.len() > 100_000;
+        if trace_capacity && large_program {
+            eprintln!(
+                "codegen capacity planning: source_len={} planned={planned_capacity}",
+                program.source_text.len()
+            );
+        }
+        self.prepare_pass(
+            program,
+            PassMode::Emit {
+                capacity: planned_capacity,
+                trace_metrics: trace_capacity && large_program,
+            },
+        );
 
         program.print(&mut self, Context::default());
+        if trace_capacity && large_program {
+            if let Some(metrics) = self.code.metrics() {
+                eprintln!(
+                    "codegen emission: final_len={} reallocations={} writes={} bytes={}",
+                    self.code_len(),
+                    metrics.reallocations(),
+                    metrics.writes(),
+                    metrics.written_bytes()
+                );
+            }
+        }
         let legal_comments = self.handle_eof_linked_or_external_comments(program);
         let code = self.code.into_string();
         let map = self.sourcemap_builder.map(SourcemapBuilder::into_sourcemap);
@@ -433,20 +458,21 @@ impl<'a> Codegen<'a> {
             total = total.saturating_add(source_len / 16);
         } else {
             // Pretty printing introduces indentation, spacing, and preserved comments.
-            total = total.saturating_add(program.comments.len() * 8);
-            total = total.saturating_add(source_len / 32);
+            total = total.saturating_add(comment_bytes);
+            total = total.saturating_add(source_len / 2);
         }
-        total.saturating_add(64)
+        total.saturating_add(256)
     }
 
     fn prepare_pass(&mut self, program: &Program<'a>, mode: PassMode) {
         self.reset_core_state();
         match mode {
-            PassMode::Emit { capacity } => {
+            PassMode::Emit { capacity, trace_metrics } => {
                 self.code.start_emission(
                     capacity,
                     self.options.indent_char,
                     self.options.indent_width,
+                    trace_metrics,
                 );
                 if let Some(path) = &self.options.source_map_path {
                     self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));

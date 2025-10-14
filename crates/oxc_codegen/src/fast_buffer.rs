@@ -5,12 +5,28 @@ use oxc_data_structures::code_buffer::{DEFAULT_INDENT_WIDTH, IndentChar};
 const MIN_CAPACITY: usize = 64;
 const ALLOCATION_ALIGNMENT: usize = 256;
 
-#[cfg(debug_assertions)]
 #[derive(Default, Clone, Copy)]
-struct BufferMetrics {
+pub(crate) struct BufferMetrics {
     reallocations: usize,
     writes: usize,
     written_bytes: usize,
+}
+
+impl BufferMetrics {
+    #[inline]
+    pub fn reallocations(&self) -> usize {
+        self.reallocations
+    }
+
+    #[inline]
+    pub fn writes(&self) -> usize {
+        self.writes
+    }
+
+    #[inline]
+    pub fn written_bytes(&self) -> usize {
+        self.written_bytes
+    }
 }
 
 pub(crate) struct FastBuffer {
@@ -19,8 +35,7 @@ pub(crate) struct FastBuffer {
     indent_char: IndentChar,
     indent_width: usize,
     last_byte: Option<u8>,
-    last_char: Option<char>,
-    #[cfg(debug_assertions)]
+    trace_metrics: bool,
     metrics: BufferMetrics,
 }
 
@@ -38,8 +53,7 @@ impl FastBuffer {
             indent_char: IndentChar::default(),
             indent_width: DEFAULT_INDENT_WIDTH,
             last_byte: None,
-            last_char: None,
-            #[cfg(debug_assertions)]
+            trace_metrics: false,
             metrics: BufferMetrics::default(),
         }
     }
@@ -51,8 +65,7 @@ impl FastBuffer {
             indent_char,
             indent_width,
             last_byte: None,
-            last_char: None,
-            #[cfg(debug_assertions)]
+            trace_metrics: false,
             metrics: BufferMetrics::default(),
         }
     }
@@ -62,6 +75,7 @@ impl FastBuffer {
         capacity: usize,
         indent_char: IndentChar,
         indent_width: usize,
+        trace_metrics: bool,
     ) {
         let aligned_capacity = Self::align_capacity(capacity);
         self.buf = Vec::with_capacity(aligned_capacity);
@@ -69,11 +83,8 @@ impl FastBuffer {
         self.indent_char = indent_char;
         self.indent_width = indent_width;
         self.last_byte = None;
-        self.last_char = None;
-        #[cfg(debug_assertions)]
-        {
-            self.metrics = BufferMetrics::default();
-        }
+        self.trace_metrics = trace_metrics;
+        self.metrics = BufferMetrics::default();
     }
 
     #[inline]
@@ -86,6 +97,11 @@ impl FastBuffer {
     #[inline]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    #[inline]
+    pub fn metrics(&self) -> Option<BufferMetrics> {
+        self.trace_metrics.then_some(self.metrics)
     }
 
     #[inline]
@@ -111,9 +127,6 @@ impl FastBuffer {
 
     #[inline]
     pub fn last_char(&self) -> Option<char> {
-        if let Some(ch) = self.last_char {
-            return Some(ch);
-        }
         if self.len == 0 {
             return None;
         }
@@ -214,7 +227,6 @@ impl FastBuffer {
     pub fn clear(&mut self) {
         self.len = 0;
         self.last_byte = None;
-        self.last_char = None;
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) {
@@ -222,22 +234,16 @@ impl FastBuffer {
             return;
         }
         self.last_byte = bytes.last().copied();
-        #[cfg(debug_assertions)]
-        {
+        let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
+        if self.trace_metrics {
             self.metrics.writes += 1;
             self.metrics.written_bytes += bytes.len();
-        }
-        let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
-        #[cfg(debug_assertions)]
-        {
             let prev_capacity = self.buf.capacity();
             self.ensure_capacity(new_len);
             if self.buf.capacity() != prev_capacity {
                 self.metrics.reallocations += 1;
             }
-        }
-        #[cfg(not(debug_assertions))]
-        {
+        } else {
             self.ensure_capacity(new_len);
         }
         debug_assert!(
@@ -251,13 +257,6 @@ impl FastBuffer {
             ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
         self.len = new_len;
-        let mut last_char = decode_last_char(bytes);
-        if last_char.is_none() {
-            // SAFETY: `new_len` bytes were written
-            let slice = unsafe { slice::from_raw_parts(self.buf.as_ptr(), new_len) };
-            last_char = decode_last_char(slice);
-        }
-        self.last_char = last_char;
     }
 
     #[inline]

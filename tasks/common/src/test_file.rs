@@ -2,7 +2,7 @@ use std::fmt;
 
 use oxc_span::SourceType;
 
-use crate::{offline_fixtures, project_root, request::agent};
+use crate::{project_root, request::agent};
 
 pub struct TestFiles {
     files: Vec<TestFile>,
@@ -104,33 +104,22 @@ impl TestFile {
         let file = project_root().join("target").join(filename);
 
         if let Ok(code) = std::fs::read_to_string(&file) {
-            return Ok((filename.to_string(), code));
-        }
+            Ok((filename.to_string(), code))
+        } else {
+            println!("[{filename}] - Downloading [{lib}] to [{}]", file.display());
+            match agent().get(lib).call() {
+                Ok(mut response) => {
+                    let mut reader = response.body_mut().as_reader();
 
-        println!("[{filename}] - Downloading [{lib}] to [{}]", file.display());
-        match agent().get(lib).call() {
-            Ok(mut response) => {
-                let mut reader = response.body_mut().as_reader();
+                    let _drop = std::fs::remove_file(&file);
+                    let mut writer = std::fs::File::create(&file).map_err(err_to_string)?;
+                    std::io::copy(&mut reader, &mut writer).map_err(err_to_string)?;
 
-                let _drop = std::fs::remove_file(&file);
-                let mut writer = std::fs::File::create(&file).map_err(err_to_string)?;
-                std::io::copy(&mut reader, &mut writer).map_err(err_to_string)?;
-
-                std::fs::read_to_string(&file)
-                    .map_err(err_to_string)
-                    .map(|code| (filename.to_string(), code))
-            }
-            Err(e) => {
-                if let Some(code) = offline_fixtures::offline_fixture(filename) {
-                    println!("[{filename}] - Using offline fixture after download failure: {e:?}");
-                    if let Some(parent) = file.parent() {
-                        std::fs::create_dir_all(parent).map_err(err_to_string)?;
-                    }
-                    std::fs::write(&file, code.as_bytes()).map_err(err_to_string)?;
-                    Ok((filename.to_string(), code.into_owned()))
-                } else {
-                    Err(format!("{e:?}"))
+                    std::fs::read_to_string(&file)
+                        .map_err(err_to_string)
+                        .map(|code| (filename.to_string(), code))
                 }
+                Err(e) => Err(format!("{e:?}")),
             }
         }
     }
