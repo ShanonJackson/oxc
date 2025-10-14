@@ -33,17 +33,14 @@ mod options;
 mod sourcemap_builder;
 mod str;
 
-use binary_expr_visitor::BinaryExpressionVisitor;
+use binary_expr_visitor::BinaryExpressionStack;
 use comment::CommentsMap;
 use fast_buffer::FastBuffer;
 use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
 
-const TWO_PASS_HEURISTIC: usize = 4 * 1024;
-
 enum PassMode {
-    Measure,
-    Emit { capacity: usize },
+    Emit { capacity: usize, trace_metrics: bool },
 }
 use str::{Quote, cold_branch, is_script_close_tag};
 
@@ -104,7 +101,7 @@ pub struct Codegen<'a> {
     prev_reg_exp_end: usize,
     need_space_before_dot: usize,
     print_next_indent_as_space: bool,
-    binary_expr_stack: Stack<BinaryExpressionVisitor<'a>>,
+    binary_expr_stack: BinaryExpressionStack<'a>,
     class_stack: Stack<ClassId>,
     next_class_id: ClassId,
     /// Indicates the output is JSX type, it is set in [`Program::gen`] and the result
@@ -167,7 +164,7 @@ impl<'a> Codegen<'a> {
             needs_semicolon: false,
             need_space_before_dot: 0,
             print_next_indent_as_space: false,
-            binary_expr_stack: Stack::with_capacity(12),
+            binary_expr_stack: BinaryExpressionStack::with_spill_capacity(8),
             class_stack: Stack::with_capacity(4),
             next_class_id: ClassId::from_usize(0),
             prev_op_end: 0,
@@ -229,20 +226,35 @@ impl<'a> Codegen<'a> {
     pub fn build(mut self, program: &Program<'a>) -> CodegenReturn {
         self.quote = if self.options.single_quote { Quote::Single } else { Quote::Double };
         self.source_text = Some(program.source_text);
-        let use_two_pass = program.source_text.len() > TWO_PASS_HEURISTIC;
-
-        if use_two_pass {
-            self.prepare_pass(program, PassMode::Measure);
-            program.print(&mut self, Context::default());
-            let measured_len = self.code.len();
-            self.prepare_pass(program, PassMode::Emit { capacity: measured_len });
-        } else {
-            let initial_capacity =
-                program.source_text.len().saturating_add(program.comments.len() * 8);
-            self.prepare_pass(program, PassMode::Emit { capacity: initial_capacity });
+        let planned_capacity = self.estimate_output_capacity(program);
+        let trace_capacity = std::env::var("OXCCODEGEN_TRACE_CAP").is_ok();
+        let large_program = program.source_text.len() > 100_000;
+        if trace_capacity && large_program {
+            eprintln!(
+                "codegen capacity planning: source_len={} planned={planned_capacity}",
+                program.source_text.len()
+            );
         }
+        self.prepare_pass(
+            program,
+            PassMode::Emit {
+                capacity: planned_capacity,
+                trace_metrics: trace_capacity && large_program,
+            },
+        );
 
         program.print(&mut self, Context::default());
+        if trace_capacity && large_program {
+            if let Some(metrics) = self.code.metrics() {
+                eprintln!(
+                    "codegen emission: final_len={} reallocations={} writes={} bytes={}",
+                    self.code_len(),
+                    metrics.reallocations(),
+                    metrics.writes(),
+                    metrics.written_bytes()
+                );
+            }
+        }
         let legal_comments = self.handle_eof_linked_or_external_comments(program);
         let code = self.code.into_string();
         let map = self.sourcemap_builder.map(SourcemapBuilder::into_sourcemap);
@@ -435,18 +447,32 @@ impl<'a> Codegen<'a> {
         self.code.clear();
     }
 
+    fn estimate_output_capacity(&self, program: &Program<'a>) -> usize {
+        let source_len = program.source_text.len();
+        let comment_bytes =
+            program.comments.iter().map(|comment| comment.span.size() as usize).sum::<usize>();
+
+        let mut total = source_len.saturating_add(comment_bytes);
+        if self.options.minify {
+            // Minification typically removes whitespace but may insert separators between tokens.
+            total = total.saturating_add(source_len / 16);
+        } else {
+            // Pretty printing introduces indentation, spacing, and preserved comments.
+            total = total.saturating_add(comment_bytes);
+            total = total.saturating_add(source_len / 2);
+        }
+        total.saturating_add(256)
+    }
+
     fn prepare_pass(&mut self, program: &Program<'a>, mode: PassMode) {
         self.reset_core_state();
         match mode {
-            PassMode::Measure => {
-                self.code.start_measurement(self.options.indent_char, self.options.indent_width);
-                self.sourcemap_builder = None;
-            }
-            PassMode::Emit { capacity } => {
+            PassMode::Emit { capacity, trace_metrics } => {
                 self.code.start_emission(
                     capacity,
                     self.options.indent_char,
                     self.options.indent_width,
+                    trace_metrics,
                 );
                 if let Some(path) = &self.options.source_map_path {
                     self.sourcemap_builder = Some(SourcemapBuilder::new(path, program.source_text));

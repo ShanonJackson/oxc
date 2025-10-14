@@ -1,8 +1,9 @@
 use std::fmt;
 
 use oxc_span::SourceType;
+use ureq::tls::TlsProvider;
 
-use crate::{project_root, request::agent};
+use crate::{project_root, request};
 
 pub struct TestFiles {
     files: Vec<TestFile>,
@@ -107,20 +108,26 @@ impl TestFile {
             Ok((filename.to_string(), code))
         } else {
             println!("[{filename}] - Downloading [{lib}] to [{}]", file.display());
-            match agent().get(lib).call() {
-                Ok(mut response) => {
-                    let mut reader = response.body_mut().as_reader();
+            let mut last_error = None;
+            for provider in [TlsProvider::Rustls, TlsProvider::NativeTls] {
+                let agent = request::agent_with(provider);
+                match agent.get(lib).call() {
+                    Ok(mut response) => {
+                        let mut reader = response.body_mut().as_reader();
 
-                    let _drop = std::fs::remove_file(&file);
-                    let mut writer = std::fs::File::create(&file).map_err(err_to_string)?;
-                    std::io::copy(&mut reader, &mut writer).map_err(err_to_string)?;
+                        let _drop = std::fs::remove_file(&file);
+                        let mut writer = std::fs::File::create(&file).map_err(err_to_string)?;
+                        std::io::copy(&mut reader, &mut writer).map_err(err_to_string)?;
 
-                    std::fs::read_to_string(&file)
-                        .map_err(err_to_string)
-                        .map(|code| (filename.to_string(), code))
+                        return std::fs::read_to_string(&file)
+                            .map_err(err_to_string)
+                            .map(|code| (filename.to_string(), code));
+                    }
+                    Err(err) => last_error = Some(format!("{err:?}")),
                 }
-                Err(e) => Err(format!("{e:?}")),
             }
+
+            Err(last_error.unwrap_or_else(|| "all TLS providers unavailable".to_string()))
         }
     }
 }
