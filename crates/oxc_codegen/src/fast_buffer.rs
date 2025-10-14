@@ -226,6 +226,7 @@ impl FastBuffer {
     #[inline]
     pub fn clear(&mut self) {
         self.len = 0;
+        self.buf.clear();
         self.last_byte = None;
     }
 
@@ -235,15 +236,22 @@ impl FastBuffer {
         }
         self.last_byte = bytes.last().copied();
         let new_len = self.len.checked_add(bytes.len()).expect("buffer length overflow");
+        let needs_growth = new_len > self.buf.capacity();
         if self.trace_metrics {
             self.metrics.writes += 1;
             self.metrics.written_bytes += bytes.len();
             let prev_capacity = self.buf.capacity();
+            if needs_growth {
+                unsafe { self.buf.set_len(self.len); }
+            }
             self.ensure_capacity(new_len);
             if self.buf.capacity() != prev_capacity {
                 self.metrics.reallocations += 1;
             }
         } else {
+            if needs_growth {
+                unsafe { self.buf.set_len(self.len); }
+            }
             self.ensure_capacity(new_len);
         }
         debug_assert!(
