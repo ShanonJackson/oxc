@@ -119,9 +119,20 @@ impl<'a, 's> Parser<'a, 's> {
 
     fn parse_expression_statement(&mut self) -> Option<Statement<'a>> {
         let start = self.cur.start;
-        let expr = self.parse_expression();
-        // Swallow postfix call chains: (expr)(...)(...)
-        while self.cur.kind == TokKind::LParen { self.consume_balanced_parens(); }
+        // Top-level IIFE fast path: swallow full paren chain as one expr
+        let expr = if self.cur.kind == TokKind::LParen {
+            let iife_start = self.cur.start;
+            self.consume_balanced_any_from_lparen();
+            while self.cur.kind == TokKind::LParen { self.consume_balanced_parens(); }
+            let span = Span::new(iife_start, self.cur.end);
+            let inner = self.emit.expr_ident(span, "_");
+            self.emit.expr_paren(span, inner)
+        } else {
+            let mut e = self.parse_expression();
+            // Swallow postfix call chains: (expr)(...)(...)
+            while self.cur.kind == TokKind::LParen { self.consume_balanced_parens(); }
+            e
+        };
         // Only finalize on explicit semicolon, closing brace, or EOF
         match self.cur.kind {
             TokKind::Semi => { self.bump(); }
@@ -144,6 +155,7 @@ impl<'a, 's> Parser<'a, 's> {
 
     fn parse_bin_expr(&mut self, min_prec: u8) -> Expression<'a> {
         let mut left = self.parse_primary();
+        left = self.swallow_postfix_calls(left);
         loop {
             let (op, prec) = match self.cur.kind {
                 TokKind::Plus => (Some(oxc_syntax::operator::BinaryOperator::Addition), 1),
@@ -170,6 +182,7 @@ impl<'a, 's> Parser<'a, 's> {
                 }
                 let span = Span::new(left.span().start, right.span().end);
                 left = Expression::BinaryExpression(self.emit.b.alloc(BinaryExpression { span, operator, left, right }));
+                left = self.swallow_postfix_calls(left);
                 continue;
             }
             break;
@@ -178,6 +191,7 @@ impl<'a, 's> Parser<'a, 's> {
     }
 
     fn parse_expression_with_left(&mut self, mut left: Expression<'a>) -> Expression<'a> {
+        left = self.swallow_postfix_calls(left);
         loop {
             let (op, prec) = match self.cur.kind {
                 TokKind::Plus => (Some(oxc_syntax::operator::BinaryOperator::Addition), 1),
@@ -201,6 +215,7 @@ impl<'a, 's> Parser<'a, 's> {
                 }
                 let span = Span::new(left.span().start, right.span().end);
                 left = Expression::BinaryExpression(self.emit.b.alloc(BinaryExpression { span, operator, left, right }));
+                left = self.swallow_postfix_calls(left);
                 continue;
             }
             break;
@@ -233,12 +248,24 @@ impl<'a, 's> Parser<'a, 's> {
                 self.emit.expr_string(span, cooked)
             }
             TokKind::LParen => {
+                // Parse parenthesized expression: ( expr (, expr)* ) → return last expr wrapped
                 let start = self.cur.start;
-                // Consume a fully balanced parenthesized construct, including any nested braces
-                self.consume_balanced_any_from_lparen();
+                self.bump();
+                // Special-case function expression inside parens: (function (...) { ... })
+                let mut last = if self.cur.kind == TokKind::Ident {
+                    let s = &self.source_text[self.cur.start as usize..self.cur.end as usize];
+                    if s == "function" {
+                        self.consume_dummy_function_like_expr()
+                    } else {
+                        self.parse_expression()
+                    }
+                } else {
+                    self.parse_expression()
+                };
+                while self.cur.kind == TokKind::Comma { self.bump(); last = self.parse_expression(); }
+                if self.cur.kind == TokKind::RParen { self.bump(); } else { self.consume_balanced_parens(); }
                 let span = Span::new(start, self.cur.end);
-                // Represent the whole construct as a dummy identifier expression
-                self.emit.expr_ident(span, "_")
+                self.emit.expr_paren(span, last)
             }
             _ => {
                 // Fallback keeps forward progress; will be eliminated as grammar grows
@@ -263,6 +290,7 @@ impl<'a, 's> Parser<'a, 's> {
     }
 
     // Consume a 'function name(...) { ... }' like construct as a single dummy statement
+    #[cold]
     fn consume_dummy_function_like(&mut self) -> Statement<'a> {
         let start = self.cur.start;
         self.bump(); // 'function'
@@ -273,6 +301,7 @@ impl<'a, 's> Parser<'a, 's> {
         self.emit.stmt_expr(span, self.emit.expr_ident(span, "_"))
     }
 
+    #[cold]
     fn consume_balanced_parens(&mut self) {
         // assume current is '('
         let mut depth: i32 = 0;
@@ -286,6 +315,7 @@ impl<'a, 's> Parser<'a, 's> {
         }
     }
 
+    #[cold]
     fn consume_balanced_braces(&mut self) {
         // assume current is '{'
         let mut depth: i32 = 0;
@@ -297,6 +327,30 @@ impl<'a, 's> Parser<'a, 's> {
                 _ => { self.bump(); }
             }
         }
+    }
+
+    // Consume a 'function name(...) { ... }' like construct and return a dummy expression spanning it
+    #[cold]
+    fn consume_dummy_function_like_expr(&mut self) -> Expression<'a> {
+        let start = self.cur.start;
+        // current at 'function'
+        self.bump(); // 'function'
+        if self.cur.kind == TokKind::Ident { self.bump(); }
+        if self.cur.kind == TokKind::LParen { self.consume_balanced_parens(); }
+        if self.cur.kind == TokKind::LBrace { self.consume_balanced_braces(); }
+        let span = Span::new(start, self.cur.end);
+        self.emit.expr_ident(span, "_")
+    }
+
+    // After an expression, swallow chained call groups and materialize minimal CallExpressions.
+    fn swallow_postfix_calls(&mut self, mut left: Expression<'a>) -> Expression<'a> {
+        while self.cur.kind == TokKind::LParen {
+            let call_start = left.span().start;
+            self.consume_balanced_parens();
+            let span = Span::new(call_start, self.cur.end);
+            left = self.emit.expr_call_empty(span, left);
+        }
+        left
     }
 
     // Consume from a current '(' (not yet bumped) or when current is '(' after checking

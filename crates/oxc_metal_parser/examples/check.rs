@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use oxc_ast::ast::Statement;
 
 fn main() {
+    set_thread_perf_hints();
     let be = oxc_metal_parser::hot::backend::name(oxc_metal_parser::hot::backend::detect());
     let arg = std::env::args().nth(1);
     let root = arg.map(|a| resolve_path(&a)).unwrap_or_else(default_fixtures_root);
@@ -19,6 +20,11 @@ fn main() {
     }
 
     println!("backend={} files={} root={}", be, files.len(), root.display());
+    // Print key runtime settings for perf context
+    let ws = if oxc_metal_parser::hot::ws_default_enabled() { "on" } else { "off" };
+    let pf = oxc_metal_parser::hot::prefetch_distance();
+    let repeats: usize = std::env::var("METAL_CHECK_REPEAT").ok().and_then(|s| s.parse().ok()).unwrap_or(3).max(1).min(20);
+    println!("settings ws_simd={} prefetch={}B repeat={}x", ws, pf, repeats);
 
 
     let mut shape_ok = 0usize;
@@ -38,20 +44,51 @@ fn main() {
         let text = String::from_utf8_lossy(&data);
         let st = SourceType::from_path(p.as_path()).unwrap_or_else(|_| SourceType::mjs());
 
-        // Perf single run per file
-        let t0 = rdtsc_serialized();
-        let alloc_m = Allocator::new();
-        let metal = oxc_metal_parser::parse_program(&alloc_m, &text, st);
-        let t1 = rdtsc_serialized();
-
-        let t2 = rdtsc_serialized();
-        let alloc_o = Allocator::new();
-        let oxc = OxcParser::new(&alloc_o, &text, st).parse().program;
-        let t3 = rdtsc_serialized();
-
+        // Perf averaged over repeats; keep last ASTs for comparison
         let bytes = data.len() as u64;
-        let cpb_metal = (t1 - t0) as f64 / bytes as f64;
-        let cpb_oxc = (t3 - t2) as f64 / bytes as f64;
+        let mut cycles_metal: u128 = 0;
+        let alloc_m_final = Allocator::new();
+        let metal = {
+            let mut last: Option<oxc_ast::ast::Program<'_>> = None;
+            for i in 0..repeats {
+                let t0 = rdtsc_serialized();
+                if i + 1 == repeats {
+                    let prog = oxc_metal_parser::parse_program(&alloc_m_final, &text, st);
+                    let t1 = rdtsc_serialized();
+                    cycles_metal += (t1 - t0) as u128;
+                    last = Some(prog);
+                } else {
+                    let alloc_tmp = Allocator::new();
+                    let _ = oxc_metal_parser::parse_program(&alloc_tmp, &text, st);
+                    let t1 = rdtsc_serialized();
+                    cycles_metal += (t1 - t0) as u128;
+                }
+            }
+            last.unwrap()
+        };
+        let cpb_metal = (cycles_metal as f64 / repeats as f64) / bytes as f64;
+
+        let mut cycles_oxc: u128 = 0;
+        let alloc_o_final = Allocator::new();
+        let oxc = {
+            let mut last: Option<oxc_ast::ast::Program<'_>> = None;
+            for i in 0..repeats {
+                let t0 = rdtsc_serialized();
+                if i + 1 == repeats {
+                    let prog = OxcParser::new(&alloc_o_final, &text, st).parse().program;
+                    let t1 = rdtsc_serialized();
+                    cycles_oxc += (t1 - t0) as u128;
+                    last = Some(prog);
+                } else {
+                    let alloc_tmp = Allocator::new();
+                    let _ = OxcParser::new(&alloc_tmp, &text, st).parse().program;
+                    let t1 = rdtsc_serialized();
+                    cycles_oxc += (t1 - t0) as u128;
+                }
+            }
+            last.unwrap()
+        };
+        let cpb_oxc = (cycles_oxc as f64 / repeats as f64) / bytes as f64;
         cpb_metal_sum += cpb_metal;
         cpb_oxc_sum += cpb_oxc;
         bytes_sum += bytes;
@@ -98,24 +135,56 @@ fn main() {
                 let mut saved = std::env::var("METAL_BACKEND").ok();
 
                 unsafe { std::env::set_var("METAL_BACKEND", "scalar"); }
-                let t0 = rdtsc_serialized();
-                let alloc = Allocator::new();
-                let pr_scalar = oxc_metal_parser::parse_program(&alloc, &text, st);
-                let t1 = rdtsc_serialized();
+                let mut cyc_s: u128 = 0;
+                let alloc_scalar_final = Allocator::new();
+                let pr_scalar = {
+                    let mut last = None;
+                    for i in 0..repeats {
+                        let t0 = rdtsc_serialized();
+                        if i + 1 == repeats {
+                            let prog = oxc_metal_parser::parse_program(&alloc_scalar_final, &text, st);
+                            let t1 = rdtsc_serialized();
+                            cyc_s += (t1 - t0) as u128;
+                            last = Some(prog);
+                        } else {
+                            let alloc_tmp = Allocator::new();
+                            let _ = oxc_metal_parser::parse_program(&alloc_tmp, &text, st);
+                            let t1 = rdtsc_serialized();
+                            cyc_s += (t1 - t0) as u128;
+                        }
+                    }
+                    last.unwrap()
+                };
                 let h_scalar = oxc_metal_parser::structural_hash(&pr_scalar);
 
                 unsafe { std::env::set_var("METAL_BACKEND", "avx2"); }
-                let t2 = rdtsc_serialized();
-                let alloc = Allocator::new();
-                let pr_avx2 = oxc_metal_parser::parse_program(&alloc, &text, st);
-                let t3 = rdtsc_serialized();
+                let mut cyc_v: u128 = 0;
+                let alloc_avx2_final = Allocator::new();
+                let pr_avx2 = {
+                    let mut last = None;
+                    for i in 0..repeats {
+                        let t0 = rdtsc_serialized();
+                        if i + 1 == repeats {
+                            let prog = oxc_metal_parser::parse_program(&alloc_avx2_final, &text, st);
+                            let t1 = rdtsc_serialized();
+                            cyc_v += (t1 - t0) as u128;
+                            last = Some(prog);
+                        } else {
+                            let alloc_tmp = Allocator::new();
+                            let _ = oxc_metal_parser::parse_program(&alloc_tmp, &text, st);
+                            let t1 = rdtsc_serialized();
+                            cyc_v += (t1 - t0) as u128;
+                        }
+                    }
+                    last.unwrap()
+                };
                 let h_avx2 = oxc_metal_parser::structural_hash(&pr_avx2);
 
                 if let Some(v) = saved.take() { unsafe { std::env::set_var("METAL_BACKEND", v); } } else { unsafe { std::env::remove_var("METAL_BACKEND"); } }
 
                 let bytes = data.len() as u64;
-                let cpb_scalar = (t1 - t0) as f64 / bytes as f64;
-                let cpb_avx2 = (t3 - t2) as f64 / bytes as f64;
+                let cpb_scalar = (cyc_s as f64 / repeats as f64) / bytes as f64;
+                let cpb_avx2 = (cyc_v as f64 / repeats as f64) / bytes as f64;
                 let ok = h_scalar == h_avx2;
                 println!(
                     "ab file={} size={} cpb_scalar={:.3} cpb_avx2={:.3} ab_ok={}",
@@ -285,6 +354,32 @@ fn first_tok_diff(a: &[Tok], b: &[Tok]) -> Option<(usize, Tok, Tok)> {
     }
     None
 }
+
+#[cfg(windows)]
+fn set_thread_perf_hints() {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut c_void;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn SetThreadPriority(hThread: *mut c_void, nPriority: i32) -> i32;
+        fn SetThreadAffinityMask(hThread: *mut c_void, mask: usize) -> usize;
+        fn SetPriorityClass(hProcess: *mut c_void, dwPriorityClass: u32) -> i32;
+    }
+    unsafe {
+        let thread = GetCurrentThread();
+        let process = GetCurrentProcess();
+        // HIGH_PRIORITY_CLASS
+        let _ = SetPriorityClass(process, 0x00000080);
+        // THREAD_PRIORITY_HIGHEST
+        let _ = SetThreadPriority(thread, 2);
+        // Pin to a single core (e.g., CPU 2) to reduce jitter
+        let _ = SetThreadAffinityMask(thread, 1usize << 2);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_thread_perf_hints() {}
 
 fn warmup() {
     let be = oxc_metal_parser::hot::backend::detect();

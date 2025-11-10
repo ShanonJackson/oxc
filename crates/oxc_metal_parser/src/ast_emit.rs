@@ -35,6 +35,17 @@ impl<'a> Emitter<'a> {
         self.b.expression_numeric_literal(span, value, None, oxc_syntax::number::NumberBase::Decimal)
     }
 
+    pub fn expr_paren(&self, span: Span, expr: Expression<'a>) -> Expression<'a> {
+        self.b.expression_parenthesized(span, expr)
+    }
+
+    pub fn expr_call_empty(&self, span: Span, callee: Expression<'a>) -> Expression<'a> {
+        let args = self.b.vec();
+        // Explicitly type the None for type_arguments to satisfy IntoIn
+        let type_args: Option<oxc_allocator::Box<'a, oxc_ast::ast::TSTypeParameterInstantiation<'a>>> = None;
+        self.b.expression_call(span, callee, type_args, args, false)
+    }
+
     pub fn var_decl_simple(&self, span: Span, name: &'a str, init: Expression<'a>) -> Statement<'a> {
         let id_name = IdentifierName { span, name: self.b.atom(name) };
         let binding = BindingIdentifier { span, name: id_name.name, symbol_id: Default::default() };
