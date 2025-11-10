@@ -2,6 +2,8 @@ pub mod backend;
 use core::mem::MaybeUninit;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
+#[cfg(target_arch = "x86_64")]
+use std::sync::OnceLock;
 
 /// SPOB debug shadow: asserts monotonic forward-only advancement.
 #[derive(Default, Debug, Clone, Copy)]
@@ -123,12 +125,22 @@ impl<'s> Scanner<'s> {
         #[cfg(target_arch = "x86_64")]
         {
             let len = self.src.len();
-            // Hoist constants for '.' and digit ranges
-            let dot = _mm256_set1_epi8(b'.' as i8);
-            let d0  = _mm256_set1_epi8(b'0' as i8);
-            let d9  = _mm256_set1_epi8(b'9' as i8);
+            // Hoisted constants for '.' and digit ranges
+            let (dot, d0, d9) = {
+                static DIGITS: OnceLock<(__m256i, __m256i, __m256i)> = OnceLock::new();
+                *DIGITS.get_or_init(|| unsafe {
+                    (
+                        _mm256_set1_epi8(b'.' as i8),
+                        _mm256_set1_epi8(b'0' as i8),
+                        _mm256_set1_epi8(b'9' as i8),
+                    )
+                })
+            };
             let z   = _mm256_setzero_si256();
             while self.idx + 32 <= len {
+                if self.idx + 192 < len {
+                    unsafe { _mm_prefetch(self.src.as_ptr().add(self.idx + 128) as *const i8, 3); }
+                }
                 let ptr = unsafe { self.src.as_ptr().add(self.idx) as *const __m256i };
                 let v = unsafe { _mm256_loadu_si256(ptr) };
                 // digits: v in ['0'..'9'] => (v >= '0') & (v <= '9')
@@ -139,8 +151,24 @@ impl<'s> Scanner<'s> {
                 let m = _mm256_or_si256(m_d, m_dot);
                 let mask = _mm256_movemask_epi8(m) as u32;
                 if mask == 0xFFFF_FFFF {
-                    self.advance_by(32);
-                    continue;
+                    if self.idx + 64 <= len {
+                        let ptr2 = unsafe { self.src.as_ptr().add(self.idx + 32) as *const __m256i };
+                        let v2 = unsafe { _mm256_loadu_si256(ptr2) };
+                        let ge_0b = _mm256_cmpeq_epi8(_mm256_subs_epu8(d0, v2), z);
+                        let le_9b = _mm256_cmpeq_epi8(_mm256_subs_epu8(v2, d9), z);
+                        let m_db  = _mm256_and_si256(ge_0b, le_9b);
+                        let m_dotb = _mm256_cmpeq_epi8(v2, dot);
+                        let mb = _mm256_or_si256(m_db, m_dotb);
+                        let mask2 = _mm256_movemask_epi8(mb) as u32;
+                        if mask2 == 0xFFFF_FFFF { self.advance_by(64); continue; }
+                        let not2 = (!mask2) & 0xFFFF_FFFF;
+                        let tz2 = not2.trailing_zeros() as usize;
+                        self.advance_by(32 + tz2);
+                        return;
+                    } else {
+                        self.advance_by(32);
+                        continue;
+                    }
                 }
                 let not_mask = (!mask) & 0xFFFF_FFFF;
                 let tz = not_mask.trailing_zeros() as usize;
@@ -173,15 +201,25 @@ impl<'s> Scanner<'s> {
         #[cfg(target_arch = "x86_64")]
         {
             let len = self.src.len();
-            let consts = Avx2ClassConsts::new();
+            let consts = AVX2_CLASS_CONSTS.get_or_init(Avx2ClassConsts::new);
             while self.idx + 32 <= len {
+                if self.idx + 192 < len { unsafe { _mm_prefetch(self.src.as_ptr().add(self.idx + 128) as *const i8, 3); } }
                 let ptr = unsafe { self.src.as_ptr().add(self.idx) as *const __m256i };
                 let v = unsafe { _mm256_loadu_si256(ptr) };
-                let cm = unsafe { classify32_avx2(v, &consts) };
+                let cm = unsafe { classify32_avx2(v, consts) };
                 let mask = cm.ident;
                 if mask == 0xFFFF_FFFF {
-                    self.advance_by(32);
-                    continue;
+                    if self.idx + 64 <= len {
+                        let ptr2 = unsafe { self.src.as_ptr().add(self.idx + 32) as *const __m256i };
+                        let v2 = unsafe { _mm256_loadu_si256(ptr2) };
+                        let cm2 = unsafe { classify32_avx2(v2, consts) };
+                        let mask2 = cm2.ident;
+                        if mask2 == 0xFFFF_FFFF { self.advance_by(64); continue; }
+                        let not2 = (!mask2) & 0xFFFF_FFFF;
+                        let tz2 = not2.trailing_zeros() as usize;
+                        self.advance_by(32 + tz2);
+                        return;
+                    } else { self.advance_by(32); continue; }
                 }
                 let not_mask = (!mask) & 0xFFFF_FFFF;
                 let tz = not_mask.trailing_zeros() as usize;
@@ -208,16 +246,26 @@ impl<'s> Scanner<'s> {
         #[cfg(target_arch = "x86_64")]
         {
             let len = self.src.len();
-            let consts = Avx2ClassConsts::new();
+            let consts = AVX2_CLASS_CONSTS.get_or_init(Avx2ClassConsts::new);
             // Process 32-byte chunks
             while self.idx + 32 <= len {
+                if self.idx + 192 < len { unsafe { _mm_prefetch(self.src.as_ptr().add(self.idx + 128) as *const i8, 3); } }
                 let ptr = unsafe { self.src.as_ptr().add(self.idx) as *const __m256i };
                 let v = unsafe { _mm256_loadu_si256(ptr) };
-                let cm = unsafe { classify32_avx2(v, &consts) };
+                let cm = unsafe { classify32_avx2(v, consts) };
                 let mask = cm.ws;
                 if mask == 0xFFFF_FFFF { // all whitespace
-                    self.advance_by(32);
-                    continue;
+                    if self.idx + 64 <= len {
+                        let ptr2 = unsafe { self.src.as_ptr().add(self.idx + 32) as *const __m256i };
+                        let v2 = unsafe { _mm256_loadu_si256(ptr2) };
+                        let cm2 = unsafe { classify32_avx2(v2, consts) };
+                        let mask2 = cm2.ws;
+                        if mask2 == 0xFFFF_FFFF { self.advance_by(64); continue; }
+                        let not2 = (!mask2) & 0xFFFF_FFFF;
+                        let tz2 = not2.trailing_zeros() as usize;
+                        self.advance_by(32 + tz2);
+                        return;
+                    } else { self.advance_by(32); continue; }
                 }
                 // Find first non-whitespace byte
                 let not_mask = (!mask) & 0xFFFF_FFFF;
@@ -260,8 +308,12 @@ impl<'s> Scanner<'s> {
         {
             let len = self.src.len();
             let qv = _mm256_set1_epi8(quote as i8);
-            let bsv = _mm256_set1_epi8(b'\\' as i8);
+            let bsv = {
+                static BS: OnceLock<__m256i> = OnceLock::new();
+                *BS.get_or_init(|| unsafe { _mm256_set1_epi8(b'\\' as i8) })
+            };
             while self.idx + 32 <= len {
+                if self.idx + 192 < len { unsafe { _mm_prefetch(self.src.as_ptr().add(self.idx + 128) as *const i8, 3); } }
                 let ptr = unsafe { self.src.as_ptr().add(self.idx) as *const __m256i };
                 let v = unsafe { _mm256_loadu_si256(ptr) };
                 // quotes or backslash mask using prebuilt vectors
@@ -270,8 +322,28 @@ impl<'s> Scanner<'s> {
                 let m = _mm256_or_si256(m_q, m_bs);
                 let mask = _mm256_movemask_epi8(m) as u32;
                 if mask == 0 {
-                    self.advance_by(32);
-                    continue;
+                    if self.idx + 64 <= len {
+                        let ptr2 = unsafe { self.src.as_ptr().add(self.idx + 32) as *const __m256i };
+                        let v2 = unsafe { _mm256_loadu_si256(ptr2) };
+                        let m_q2 = _mm256_cmpeq_epi8(v2, qv);
+                        let m_bs2 = _mm256_cmpeq_epi8(v2, bsv);
+                        let m2 = _mm256_or_si256(m_q2, m_bs2);
+                        let mask2 = _mm256_movemask_epi8(m2) as u32;
+                        if mask2 == 0 { self.advance_by(64); continue; }
+                        let tz2 = mask2.trailing_zeros() as usize;
+                        self.advance_by(32 + tz2);
+                        // handle the triggering byte from the second chunk
+                        if !self.is_eof() {
+                            let c = self.peek();
+                            self.advance_by(1);
+                            if c == b'\\' {
+                                if !self.is_eof() { self.advance_by(1); }
+                                continue;
+                            }
+                            if c == quote { return; }
+                        }
+                        continue;
+                    } else { self.advance_by(32); continue; }
                 }
                 let tz = mask.trailing_zeros() as usize;
                 self.advance_by(tz);
@@ -328,6 +400,9 @@ impl Avx2ClassConsts {
         }
     }}
 }
+
+#[cfg(target_arch = "x86_64")]
+static AVX2_CLASS_CONSTS: OnceLock<Avx2ClassConsts> = OnceLock::new();
 
 #[cfg(target_arch = "x86_64")]
 struct ClassMasks { ws: u32, digits: u32, ident: u32, quotes: u32, backslash: u32, dot: u32 }

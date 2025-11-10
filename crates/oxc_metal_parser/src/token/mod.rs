@@ -31,6 +31,8 @@ impl<'s> Tokenizer<'s> {
             b'*' => Some(TokKind::Star),
             b'/' => Some(TokKind::Slash),
             b'=' => Some(TokKind::Assign),
+            // Additional single-byte punctuation fast-path; treated as Other by current subset
+            b'.' | b':' | b'!' | b'~' | b'&' | b'|' | b'^' | b'%' | b'<' | b'>' | b'?' => Some(TokKind::Other),
             _ => None,
         }
     }

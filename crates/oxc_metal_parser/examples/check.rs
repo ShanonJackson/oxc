@@ -9,6 +9,8 @@ fn main() {
     let be = oxc_metal_parser::hot::backend::name(oxc_metal_parser::hot::backend::detect());
     let arg = std::env::args().nth(1);
     let root = arg.map(|a| resolve_path(&a)).unwrap_or_else(default_fixtures_root);
+    // Warm up hot paths (OnceLock AVX2 constants, tokenizer) to avoid first-parse skew
+    warmup();
     let mut files = Vec::new();
     collect_js(&root, &mut files);
     if files.is_empty() {
@@ -17,6 +19,7 @@ fn main() {
     }
 
     println!("backend={} files={} root={}", be, files.len(), root.display());
+
 
     let mut shape_ok = 0usize;
     let mut norm_ok = 0usize;
@@ -281,6 +284,29 @@ fn first_tok_diff(a: &[Tok], b: &[Tok]) -> Option<(usize, Tok, Tok)> {
         return Some((i, aa, bb));
     }
     None
+}
+
+fn warmup() {
+    let be = oxc_metal_parser::hot::backend::detect();
+    // Synthetic text to tickle ws, digits, strings, parens
+    let text = "  12345 'a' \"b\" 6789 (x)(y) // c\n/* d */";
+    let st = SourceType::mjs();
+    let alloc = Allocator::new();
+    let _ = oxc_metal_parser::parse_program(&alloc, text, st);
+    // Also warm scalar and avx2 A/B constants if available
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            let saved = std::env::var("METAL_BACKEND").ok();
+            std::env::set_var("METAL_BACKEND", "scalar");
+            let alloc = Allocator::new();
+            let _ = oxc_metal_parser::parse_program(&alloc, text, st);
+            std::env::set_var("METAL_BACKEND", "avx2");
+            let alloc = Allocator::new();
+            let _ = oxc_metal_parser::parse_program(&alloc, text, st);
+            if let Some(v) = saved { std::env::set_var("METAL_BACKEND", v); } else { std::env::remove_var("METAL_BACKEND"); }
+        }
+    }
 }
 
 fn print_first_spans(program: &oxc_ast::ast::Program<'_>, text: &str, label: &str) {
