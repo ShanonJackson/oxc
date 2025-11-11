@@ -5,9 +5,7 @@
 
 #![warn(missing_docs)]
 
-use std::{borrow::Cow, cmp, slice};
-
-use cow_utils::CowUtils;
+use std::borrow::Cow;
 
 use oxc_ast::ast::*;
 use oxc_data_structures::{code_buffer::CodeBuffer, stack::Stack};
@@ -35,7 +33,7 @@ use binary_expr_visitor::BinaryExpressionVisitor;
 use comment::CommentsMap;
 use operator::Operator;
 use sourcemap_builder::SourcemapBuilder;
-use str::{Quote, cold_branch, is_script_close_tag};
+use str::Quote;
 
 pub use context::Context;
 pub use r#gen::{Gen, GenExpr};
@@ -265,112 +263,92 @@ impl<'a> Codegen<'a> {
     /// Push str into the buffer, escaping `</script` to `<\/script`.
     #[inline]
     pub fn print_str_escaping_script_close_tag(&mut self, s: &str) {
-        // `</script` will be very rare. So we try to make the search as quick as possible by:
-        // 1. Searching for `<` first, and only checking if followed by `/script` once `<` is found.
-        // 2. Searching longer strings for `<` in chunks of 16 bytes using SIMD, and only doing the
-        //    more expensive byte-by-byte search once a `<` is found.
-
         let bytes = s.as_bytes();
+
+        // Fast path: strings shorter than the sentinel or without any `<` cannot contain
+        // `</script`, so we can avoid the chunked scan entirely.
+        if bytes.len() < 8 {
+            self.code.print_str(s);
+            return;
+        }
+
+        const BYTE_REPEAT: u64 = 0x0101_0101_0101_0101;
+        const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+        const LT_REPEATED: u64 = u64::from_ne_bytes([b'<'; 8]);
+        const CASE_FOLD_MASK: u64 = u64::from_ne_bytes([0, 0, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]);
+        const SCRIPT_CLOSING: u64 = u64::from_ne_bytes(*b"</script");
+
         let mut consumed = 0;
+        let mut index = 0;
+        let ptr = bytes.as_ptr();
+        let len = bytes.len();
 
-        // Search range of bytes for `</script`, byte by byte.
-        //
-        // Bytes between `ptr` and `last_ptr` (inclusive) are searched for `<`.
-        // If `<` is found, the following 7 bytes are checked to see if they're `/script`.
-        //
-        // Requirements for the closure below:
-        // * `ptr` and `last_ptr` must be within bounds of `bytes`.
-        // * `last_ptr` must be greater or equal to `ptr`.
-        // * `last_ptr` must be no later than 8 bytes before end of string.
-        //   i.e. safe to read 8 bytes at `end_ptr`.
-        let mut search_bytes = |mut ptr: *const u8, last_ptr| {
-            loop {
-                // SAFETY: `ptr` is always less than or equal to `last_ptr`.
-                // `last_ptr` is within bounds of `bytes`, so safe to read a byte at `ptr`.
-                let byte = unsafe { *ptr.as_ref().unwrap_unchecked() };
-                if byte == b'<' {
-                    // SAFETY: `ptr <= last_ptr`, and `last_ptr` points to no later than
-                    // 8 bytes before end of string, so safe to read 8 bytes from `ptr`
-                    let slice = unsafe { slice::from_raw_parts(ptr, 8) };
-                    if is_script_close_tag(slice) {
-                        // Push str up to and including `<`. Skip `/`. Write `\/` instead.
-                        // SAFETY:
-                        // `consumed` is initially 0, and only updated below to be after `/`,
-                        // so in bounds, and on a UTF-8 char boundary.
-                        // `index` is on `<`, so `index + 1` is in bounds and a UTF-8 char boundary.
-                        // `consumed` is always less than `index + 1` as it's set on a previous round.
-                        unsafe {
-                            let index = ptr.offset_from_unsigned(bytes.as_ptr());
-                            let before = bytes.get_unchecked(consumed..=index);
-                            self.code.print_bytes_unchecked(before);
+        while index + 8 <= len {
+            // SAFETY: `index + 8 <= len` guarantees that reading 8 bytes from `ptr.add(index)` is valid.
+            let chunk = unsafe { ptr.add(index).cast::<u64>().read_unaligned() };
+            let diff = chunk ^ LT_REPEATED;
+            let matches = diff.wrapping_sub(BYTE_REPEAT) & !diff & HIGH_BITS;
 
-                            // Set `consumed` to after `/`
-                            consumed = index + 2;
-                        }
-                        self.print_str("\\/");
-                        // Note: We could advance `ptr` by 8 bytes here to skip over `</script`,
-                        // but this branch will be very rarely taken, so it's better to keep it simple
-                    }
+            if matches == 0 {
+                index += 8;
+                continue;
+            }
+
+            let offset = (matches.trailing_zeros() as usize) >> 3;
+            index += offset;
+
+            if index + 8 > len {
+                break;
+            }
+
+            // SAFETY: `index + 8 <= len` checked above.
+            let candidate =
+                unsafe { ptr.add(index).cast::<u64>().read_unaligned() } | CASE_FOLD_MASK;
+            if candidate == SCRIPT_CLOSING {
+                // SAFETY: `consumed` only ever increases and always points to a UTF-8 boundary.
+                unsafe {
+                    let before = s.get_unchecked(consumed..=index);
+                    self.code.print_str(before);
                 }
 
-                if ptr == last_ptr {
+                self.code.print_str("\\/");
+                consumed = index + 2;
+                index += 2;
+                continue;
+            }
+
+            index += 1;
+        }
+
+        while index < len {
+            if bytes[index] == b'<' {
+                if index + 8 > len {
                     break;
                 }
-                // SAFETY: `ptr` is less than `last_ptr`, which is in bounds, so safe to increment `ptr`
-                ptr = unsafe { ptr.add(1) };
-            }
-        };
 
-        // Search string in chunks of 16 bytes
-        let mut chunks = bytes.chunks_exact(16);
-        for (chunk_index, chunk) in chunks.by_ref().enumerate() {
-            #[expect(clippy::missing_panics_doc, reason = "infallible")]
-            let chunk: &[u8; 16] = chunk.try_into().unwrap();
+                // SAFETY: `index + 8 <= len` ensures the read is within bounds.
+                let candidate =
+                    unsafe { ptr.add(index).cast::<u64>().read_unaligned() } | CASE_FOLD_MASK;
+                if candidate == SCRIPT_CLOSING {
+                    unsafe {
+                        let before = s.get_unchecked(consumed..=index);
+                        self.code.print_str(before);
+                    }
 
-            // Compiler vectorizes this loop to a few SIMD ops
-            let mut contains_lt = false;
-            for &byte in chunk {
-                if byte == b'<' {
-                    contains_lt = true;
+                    self.code.print_str("\\/");
+                    consumed = index + 2;
+                    index += 2;
+                    continue;
                 }
             }
 
-            if contains_lt {
-                // Chunk contains at least one `<`.
-                // Find them, and check if they're the start of `</script`.
-                //
-                // SAFETY: `index` is byte index of start of chunk.
-                // We search bytes starting with first byte of chunk, and ending with last byte of chunk.
-                // i.e. `index` to `index + 15` (inclusive).
-                // If this chunk is towards the end of the string, reduce the range of bytes searched
-                // so the last byte searched has at least 7 further bytes after it.
-                // i.e. safe to read 8 bytes at `last_ptr`.
-                cold_branch(|| unsafe {
-                    let index = chunk_index * 16;
-                    let remaining_bytes = bytes.len() - index;
-                    let last_offset = cmp::min(remaining_bytes - 8, 15);
-                    let ptr = bytes.as_ptr().add(index);
-                    let last_ptr = ptr.add(last_offset);
-                    search_bytes(ptr, last_ptr);
-                });
-            }
+            index += 1;
         }
 
-        // Search last chunk byte-by-byte.
-        // Skip this if less than 8 bytes remaining, because less than 8 bytes can't contain `</script`.
-        let last_chunk = chunks.remainder();
-        if last_chunk.len() >= 8 {
-            let ptr = last_chunk.as_ptr();
-            // SAFETY: `last_chunk.len() >= 8`, so `- 8` cannot wrap.
-            // `last_chunk.as_ptr().add(last_chunk.len() - 8)` is in bounds of `last_chunk`.
-            let last_ptr = unsafe { ptr.add(last_chunk.len() - 8) };
-            search_bytes(ptr, last_ptr);
-        }
-
-        // SAFETY: `consumed` is either 0, or after `/`, so on a UTF-8 char boundary, and in bounds
+        // SAFETY: `consumed` is always on a UTF-8 boundary and within bounds of `s`.
         unsafe {
-            let remaining = bytes.get_unchecked(consumed..);
-            self.code.print_bytes_unchecked(remaining);
+            let remaining = s.get_unchecked(consumed..);
+            self.code.print_str(remaining);
         }
     }
 
@@ -803,37 +781,43 @@ impl<'a> Codegen<'a> {
             return;
         }
 
-        let mut s = buffer.format(num);
-
-        if s.starts_with("0.") {
-            s = &s[1..];
+        let mut best_candidate = InlineAsciiString::from_str(buffer.format(num));
+        if best_candidate.as_bytes().starts_with(b"0.") {
+            best_candidate.remove(0);
         }
+        strip_exponent_plus_inline(&mut best_candidate);
 
-        let mut best_candidate = s.cow_replacen("e+", "e", 1);
         let mut is_hex = false;
 
         // Track the best candidate found so far
         if num.fract() == 0.0 {
             // For integers, check hex format and other optimizations
-            let hex_candidate = format!("0x{:x}", num as u128);
+            let hex_candidate = format_lower_hex_inline(num as u128);
             if hex_candidate.len() < best_candidate.len() {
                 is_hex = true;
-                best_candidate = hex_candidate.into();
+                best_candidate = hex_candidate;
             }
         }
         // Check for scientific notation optimizations for numbers starting with ".0"
-        else if best_candidate.starts_with(".0") {
-            // Skip the first '0' since we know it's there from the starts_with check
-            if let Some(i) = best_candidate.bytes().skip(2).position(|c| c != b'0') {
+        else if best_candidate.as_bytes().starts_with(b".0") {
+            let candidate = best_candidate.as_str();
+            if let Some(i) = candidate.as_bytes().iter().skip(2).position(|c| *c != b'0') {
                 let len = i + 2; // `+2` to include the dot and first zero.
-                let digits = &best_candidate[len..];
+                let digits = &candidate[len..];
                 let exp = digits.len() + len - 1;
-                let exp_str_len = itoa::Buffer::new().format(exp).len();
+                let mut exp_buf = itoa::Buffer::new();
+                let exp_str = exp_buf.format(exp);
+                let exp_str_len = exp_str.len();
                 // Calculate expected length: digits + 'e-' + exp_length
                 let expected_len = digits.len() + 2 + exp_str_len;
                 if expected_len < best_candidate.len() {
-                    best_candidate = format!("{digits}e-{exp}").into();
-                    debug_assert_eq!(best_candidate.len(), expected_len);
+                    let mut candidate_str = InlineAsciiString::new();
+                    candidate_str.push_str(digits);
+                    candidate_str.push_byte(b'e');
+                    candidate_str.push_byte(b'-');
+                    candidate_str.push_str(exp_str);
+                    debug_assert_eq!(candidate_str.len(), expected_len);
+                    best_candidate = candidate_str;
                 }
             }
         }
@@ -842,37 +826,52 @@ impl<'a> Codegen<'a> {
         // The `!is_hex` check is necessary to prevent hex numbers like `0x8000000000000000`
         // from being incorrectly converted to scientific notation
         if !is_hex
-            && best_candidate.ends_with('0')
-            && let Some(len) = best_candidate.bytes().rev().position(|c| c != b'0')
+            && best_candidate.as_str().ends_with('0')
+            && let Some(len) = best_candidate.as_bytes().iter().rev().position(|c| *c != b'0')
         {
-            let base = &best_candidate[0..best_candidate.len() - len];
-            let exp_str_len = itoa::Buffer::new().format(len).len();
+            let candidate = best_candidate.as_str();
+            let base = &candidate[0..candidate.len() - len];
+            let mut exp_buf = itoa::Buffer::new();
+            let exp_str = exp_buf.format(len);
+            let exp_str_len = exp_str.len();
             // Calculate expected length: base + 'e' + len
             let expected_len = base.len() + 1 + exp_str_len;
             if expected_len < best_candidate.len() {
-                best_candidate = format!("{base}e{len}").into();
-                debug_assert_eq!(best_candidate.len(), expected_len);
+                let mut candidate_str = InlineAsciiString::new();
+                candidate_str.push_str(base);
+                candidate_str.push_byte(b'e');
+                candidate_str.push_str(exp_str);
+                debug_assert_eq!(candidate_str.len(), expected_len);
+                best_candidate = candidate_str;
             }
         }
 
         // Check for scientific notation optimization: `1.2e101` -> `12e100`
         if let Some((integer, point, exponent)) = best_candidate
+            .as_str()
             .split_once('.')
             .and_then(|(a, b)| b.split_once('e').map(|e| (a, e.0, e.1)))
         {
             let new_expr = exponent.parse::<isize>().unwrap() - point.len() as isize;
-            let new_exp_str_len = itoa::Buffer::new().format(new_expr).len();
+            let mut exp_buf = itoa::Buffer::new();
+            let new_exp_str = exp_buf.format(new_expr);
+            let new_exp_str_len = new_exp_str.len();
             // Calculate expected length: integer + point + 'e' + new_exp_str_len
             let expected_len = integer.len() + point.len() + 1 + new_exp_str_len;
             if expected_len < best_candidate.len() {
-                best_candidate = format!("{integer}{point}e{new_expr}").into();
-                debug_assert_eq!(best_candidate.len(), expected_len);
+                let mut candidate_str = InlineAsciiString::new();
+                candidate_str.push_str(integer);
+                candidate_str.push_str(point);
+                candidate_str.push_byte(b'e');
+                candidate_str.push_str(new_exp_str);
+                debug_assert_eq!(candidate_str.len(), expected_len);
+                best_candidate = candidate_str;
             }
         }
 
         // Print the best candidate and update need_space_before_dot
-        self.print_str(&best_candidate);
-        if !best_candidate.bytes().any(|b| matches!(b, b'.' | b'e' | b'x')) {
+        self.print_str(best_candidate.as_str());
+        if !best_candidate.as_bytes().iter().any(|b| matches!(b, b'.' | b'e' | b'x')) {
             self.need_space_before_dot = self.code_len();
         }
     }
@@ -909,5 +908,149 @@ impl<'a> Codegen<'a> {
         {
             sourcemap_builder.add_source_mapping_for_name(self.code.as_bytes(), span, name);
         }
+    }
+}
+
+fn strip_exponent_plus_inline(s: &mut InlineAsciiString) {
+    let len = s.len();
+    if len < 2 {
+        return;
+    }
+
+    let bytes = s.as_mut_bytes();
+    for i in 0..(len - 1) {
+        if matches!(bytes[i], b'e' | b'E') && bytes[i + 1] == b'+' {
+            for j in i + 1..len - 1 {
+                bytes[j] = bytes[j + 1];
+            }
+            s.truncate(len - 1);
+            return;
+        }
+    }
+}
+
+fn format_lower_hex_inline(mut value: u128) -> InlineAsciiString {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+
+    let mut out = InlineAsciiString::new();
+    out.push_str("0x");
+
+    if value == 0 {
+        out.push_byte(b'0');
+        return out;
+    }
+
+    let mut buf = [0u8; 32];
+    let mut len = 0usize;
+    while value != 0 {
+        buf[len] = (value & 0xF) as u8;
+        value >>= 4;
+        len += 1;
+    }
+
+    while len > 0 {
+        len -= 1;
+        out.push_byte(HEX[buf[len] as usize]);
+    }
+
+    out
+}
+
+#[derive(Clone, Copy)]
+struct InlineAsciiString {
+    len: u8,
+    buf: [u8; InlineAsciiString::CAPACITY],
+}
+
+impl InlineAsciiString {
+    const CAPACITY: usize = 64;
+
+    #[inline]
+    fn new() -> Self {
+        Self { len: 0, buf: [0; Self::CAPACITY] }
+    }
+
+    #[inline]
+    fn from_str(s: &str) -> Self {
+        let mut out = Self::new();
+        out.push_str(s);
+        out
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        // SAFETY: All methods ensure the buffer remains valid ASCII / UTF-8.
+        unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len()]
+    }
+
+    #[inline]
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        let len = self.len();
+        &mut self.buf[..len]
+    }
+
+    #[inline]
+    fn push_byte(&mut self, byte: u8) {
+        debug_assert!(byte.is_ascii());
+        let len = self.len();
+        debug_assert!(len < Self::CAPACITY);
+        self.buf[len] = byte;
+        self.len = (len + 1) as u8;
+    }
+
+    #[inline]
+    fn push_str(&mut self, s: &str) {
+        let len = self.len();
+        let new_len = len + s.len();
+        debug_assert!(new_len <= Self::CAPACITY);
+        self.buf[len..new_len].copy_from_slice(s.as_bytes());
+        self.len = new_len as u8;
+    }
+
+    #[inline]
+    fn truncate(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.len());
+        self.len = new_len as u8;
+    }
+
+    #[inline]
+    fn remove(&mut self, index: usize) {
+        debug_assert!(index < self.len());
+        let len = self.len();
+        self.buf.copy_within(index + 1..len, index);
+        self.len = (len - 1) as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InlineAsciiString, format_lower_hex_inline, strip_exponent_plus_inline};
+
+    #[test]
+    fn strip_exponent_plus_in_place() {
+        let mut value = InlineAsciiString::from_str("1e+10");
+        strip_exponent_plus_inline(&mut value);
+        assert_eq!(value.as_str(), "1e10");
+
+        let mut unchanged = InlineAsciiString::from_str("2e-5");
+        strip_exponent_plus_inline(&mut unchanged);
+        assert_eq!(unchanged.as_str(), "2e-5");
+    }
+
+    #[test]
+    fn format_lower_hex_matches_expected() {
+        assert_eq!(format_lower_hex_inline(0).as_str(), "0x0");
+        assert_eq!(format_lower_hex_inline(0x123abc).as_str(), "0x123abc");
+        assert_eq!(format_lower_hex_inline(0x8000_0000_0000_0000).as_str(), "0x8000000000000000");
     }
 }

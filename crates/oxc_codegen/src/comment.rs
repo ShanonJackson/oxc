@@ -1,6 +1,6 @@
-use std::{borrow::Cow, iter::FusedIterator};
+use std::{borrow::Cow, cell::Cell, iter::FusedIterator};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use oxc_ast::{Comment, CommentKind, ast::Program};
 use oxc_syntax::identifier::is_line_terminator;
@@ -11,7 +11,122 @@ use crate::{
     str::{LS_LAST_2_BYTES, LS_OR_PS_FIRST_BYTE, PS_LAST_2_BYTES},
 };
 
-pub type CommentsMap = FxHashMap</* attached_to */ u32, Vec<Comment>>;
+#[derive(Default)]
+pub struct CommentsMap {
+    keys: Vec<u32>,
+    values: Vec<Option<Vec<Comment>>>,
+    remaining: usize,
+    cached_lookup: Cell<Option<(u32, usize)>>,
+}
+
+impl CommentsMap {
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.values.clear();
+        self.remaining = 0;
+        self.cached_lookup.set(None);
+    }
+
+    fn rebuild(&mut self, mut items: Vec<(u32, Comment)>) {
+        if items.is_empty() {
+            self.clear();
+            return;
+        }
+
+        items.sort_unstable_by_key(|(start, _)| *start);
+
+        self.keys.clear();
+        self.values.clear();
+        self.keys.reserve(items.len());
+        self.values.reserve(items.len());
+
+        let mut index = 0;
+        while index < items.len() {
+            let start = items[index].0;
+            self.keys.push(start);
+
+            let mut group = Vec::new();
+            while index < items.len() && items[index].0 == start {
+                group.push(items[index].1);
+                index += 1;
+            }
+            self.values.push(Some(group));
+        }
+
+        self.remaining = self.values.len();
+        self.cached_lookup.set(None);
+    }
+
+    #[inline]
+    fn find_index(&self, start: u32) -> Option<usize> {
+        match self.keys.binary_search(&start) {
+            Ok(index) => Some(index),
+            Err(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
+    }
+
+    #[inline]
+    pub fn has(&self, start: u32) -> bool {
+        if self.remaining == 0 {
+            self.cached_lookup.set(None);
+            return false;
+        }
+
+        if let Some((cached_start, index)) = self.cached_lookup.get() {
+            if cached_start == start {
+                return self.values.get(index).is_some_and(|value| value.is_some());
+            }
+        }
+
+        let Some(index) = self.find_index(start) else {
+            self.cached_lookup.set(None);
+            return false;
+        };
+
+        self.cached_lookup.set(Some((start, index)));
+        self.values.get(index).is_some_and(|value| value.is_some())
+    }
+
+    #[inline]
+    pub fn take(&mut self, start: u32) -> Option<Vec<Comment>> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let index = if let Some((cached_start, index)) = self.cached_lookup.get() {
+            if cached_start == start {
+                index
+            } else {
+                let index = self.find_index(start)?;
+                self.cached_lookup.set(Some((start, index)));
+                index
+            }
+        } else {
+            let index = self.find_index(start)?;
+            self.cached_lookup.set(Some((start, index)));
+            index
+        };
+
+        let Some(value) = self.values.get_mut(index) else {
+            return None;
+        };
+        let comments = value.take()?;
+        self.remaining -= 1;
+
+        if self.remaining == 0
+            || self.cached_lookup.get().is_some_and(|(_, cached_index)| cached_index == index)
+        {
+            self.cached_lookup.set(None);
+        }
+
+        Some(comments)
+    }
+}
 
 /// Custom iterator that splits text on line terminators while handling CRLF as a single unit.
 /// This avoids creating empty strings between CR and LF characters.
@@ -40,66 +155,149 @@ impl<'a> Iterator for LineTerminatorSplitter<'a> {
             return None;
         }
 
-        for (index, &byte) in self.text.as_bytes().iter().enumerate() {
-            match byte {
-                b'\n' => {
-                    // SAFETY: Byte at `index` is `\n`, so `index` and `index + 1` are both UTF-8 char boundaries.
-                    // Therefore, slices up to `index` and from `index + 1` are both valid `&str`s.
-                    unsafe {
-                        let line = self.text.get_unchecked(..index);
-                        self.text = self.text.get_unchecked(index + 1..);
-                        return Some(line);
-                    }
-                }
-                b'\r' => {
-                    // SAFETY: Byte at `index` is `\r`, so `index` is on a UTF-8 char boundary
-                    let line = unsafe { self.text.get_unchecked(..index) };
-                    // If the next byte is `\n`, consume it as well
-                    let skip_bytes =
-                        if self.text.as_bytes().get(index + 1) == Some(&b'\n') { 2 } else { 1 };
-                    // SAFETY: `index + skip_bytes` is after `\r` or `\n`, so on a UTF-8 char boundary.
-                    // Therefore slice from `index + skip_bytes` is a valid `&str`.
-                    self.text = unsafe { self.text.get_unchecked(index + skip_bytes..) };
-                    return Some(line);
-                }
-                LS_OR_PS_FIRST_BYTE => {
-                    let next2: [u8; 2] = {
-                        // SAFETY: 0xE2 is always the start of a 3-byte Unicode character,
-                        // so there must be 2 more bytes available to consume
-                        let next2 =
-                            unsafe { self.text.as_bytes().get_unchecked(index + 1..index + 3) };
-                        next2.try_into().unwrap()
-                    };
-                    // If this is LS or PS, treat it as a line terminator
-                    if matches!(next2, LS_LAST_2_BYTES | PS_LAST_2_BYTES) {
-                        // SAFETY: `index` is the start of a 3-byte Unicode character,
-                        // so `index` and `index + 3` are both UTF-8 char boundaries.
-                        // Therefore, slices up to `index` and from `index + 3` are both valid `&str`s.
-                        unsafe {
-                            let line = self.text.get_unchecked(..index);
-                            self.text = self.text.get_unchecked(index + 3..);
-                            return Some(line);
-                        }
-                    }
-                }
-                _ => {}
+        let bytes = self.text.as_bytes();
+        let ascii_index = find_ascii_break(bytes);
+        let ls_index = find_unicode_break(bytes);
+
+        match (ascii_index, ls_index) {
+            (Some(i), Some(j)) if j < i => split_on_ls(self, j),
+            (Some(i), Some(_)) | (Some(i), None) => split_on_ascii(self, i),
+            (None, Some(j)) => split_on_ls(self, j),
+            (None, None) => {
+                let line = self.text;
+                self.text = "";
+                Some(line)
             }
         }
-
-        // No line break found - return the remaining text. Next call will return `None`.
-        let line = self.text;
-        self.text = "";
-        Some(line)
     }
 }
 
 impl FusedIterator for LineTerminatorSplitter<'_> {}
 
+#[inline]
+fn split_on_ascii<'a>(splitter: &mut LineTerminatorSplitter<'a>, index: usize) -> Option<&'a str> {
+    let bytes = splitter.text.as_bytes();
+    match bytes[index] {
+        b'\n' => unsafe {
+            let line = splitter.text.get_unchecked(..index);
+            splitter.text = splitter.text.get_unchecked(index + 1..);
+            Some(line)
+        },
+        b'\r' => {
+            let line = unsafe { splitter.text.get_unchecked(..index) };
+            let skip = if bytes.get(index + 1) == Some(&b'\n') { 2 } else { 1 };
+            splitter.text = unsafe { splitter.text.get_unchecked(index + skip..) };
+            Some(line)
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[inline]
+fn split_on_ls<'a>(splitter: &mut LineTerminatorSplitter<'a>, index: usize) -> Option<&'a str> {
+    unsafe {
+        let line = splitter.text.get_unchecked(..index);
+        splitter.text = splitter.text.get_unchecked(index + 3..);
+        Some(line)
+    }
+}
+
+fn find_unicode_break(bytes: &[u8]) -> Option<usize> {
+    let mut search = bytes;
+    let mut offset = 0usize;
+
+    while let Some(index) = find_byte(search, LS_OR_PS_FIRST_BYTE) {
+        let candidate = offset + index;
+        if candidate + 2 >= bytes.len() {
+            break;
+        }
+        let next2 = [bytes[candidate + 1], bytes[candidate + 2]];
+        if matches!(next2, LS_LAST_2_BYTES | PS_LAST_2_BYTES) {
+            return Some(candidate);
+        }
+        let next_start = index + 1;
+        search = &search[next_start..];
+        offset += next_start;
+    }
+
+    None
+}
+
+fn find_ascii_break(bytes: &[u8]) -> Option<usize> {
+    const BYTE_REPEAT: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    const NL_REPEATED: u64 = u64::from_ne_bytes([b'\n'; 8]);
+    const CR_REPEATED: u64 = u64::from_ne_bytes([b'\r'; 8]);
+
+    let ptr = bytes.as_ptr();
+    let len = bytes.len();
+    let mut index = 0usize;
+
+    while index + 8 <= len {
+        let chunk = unsafe { ptr.add(index).cast::<u64>().read_unaligned() };
+        let nl_diff = chunk ^ NL_REPEATED;
+        let nl_matches = nl_diff.wrapping_sub(BYTE_REPEAT) & !nl_diff & HIGH_BITS;
+        let cr_diff = chunk ^ CR_REPEATED;
+        let cr_matches = cr_diff.wrapping_sub(BYTE_REPEAT) & !cr_diff & HIGH_BITS;
+        let combined = nl_matches | cr_matches;
+        if combined != 0 {
+            let offset = (combined.trailing_zeros() as usize) >> 3;
+            return Some(index + offset);
+        }
+        index += 8;
+    }
+
+    while index < len {
+        let byte = unsafe { *ptr.add(index) };
+        if byte == b'\n' || byte == b'\r' {
+            return Some(index);
+        }
+        index += 1;
+    }
+
+    None
+}
+
+fn find_byte(bytes: &[u8], target: u8) -> Option<usize> {
+    const BYTE_REPEAT: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    let repeated = u64::from_ne_bytes([target; 8]);
+
+    let ptr = bytes.as_ptr();
+    let len = bytes.len();
+    let mut index = 0usize;
+
+    while index + 8 <= len {
+        let chunk = unsafe { ptr.add(index).cast::<u64>().read_unaligned() };
+        let diff = chunk ^ repeated;
+        let matches = diff.wrapping_sub(BYTE_REPEAT) & !diff & HIGH_BITS;
+        if matches != 0 {
+            let offset = (matches.trailing_zeros() as usize) >> 3;
+            return Some(index + offset);
+        }
+        index += 8;
+    }
+
+    while index < len {
+        if unsafe { *ptr.add(index) } == target {
+            return Some(index);
+        }
+        index += 1;
+    }
+
+    None
+}
+
 impl Codegen<'_> {
     pub(crate) fn build_comments(&mut self, comments: &[Comment]) {
         if self.options.comments == CommentOptions::disabled() {
+            self.comments.clear();
             return;
         }
+
+        let mut filtered = Vec::new();
+        filtered.reserve(comments.len());
+
         for comment in comments {
             // Omit pure comments because they are handled separately.
             if comment.is_pure() || comment.is_no_side_effects() {
@@ -121,17 +319,20 @@ impl Codegen<'_> {
                 }
             }
             if add {
-                self.comments.entry(comment.attached_to).or_default().push(*comment);
+                filtered.push((comment.attached_to, *comment));
             }
         }
+
+        self.comments.rebuild(filtered);
     }
 
+    #[inline]
     pub(crate) fn has_comment(&self, start: u32) -> bool {
-        self.comments.contains_key(&start)
+        self.comments.has(start)
     }
 
     pub(crate) fn print_leading_comments(&mut self, start: u32) {
-        if let Some(comments) = self.comments.remove(&start) {
+        if let Some(comments) = self.comments.take(start) {
             self.print_comments(&comments);
         }
     }
@@ -140,7 +341,7 @@ impl Codegen<'_> {
         if self.comments.is_empty() {
             return None;
         }
-        self.comments.remove(&start)
+        self.comments.take(start)
     }
 
     #[inline]
@@ -154,7 +355,7 @@ impl Codegen<'_> {
         if self.comments.is_empty() {
             return false;
         }
-        let Some(comments) = self.comments.remove(&start) else { return false };
+        let Some(comments) = self.comments.take(start) else { return false };
 
         for comment in &comments {
             self.print_hard_newline();
